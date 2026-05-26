@@ -9,7 +9,6 @@ Aggregates financial health data from the remittance_split, savings_goals, bill_
 - Admin-only archival and cleanup of old reports
 - Storage TTL management (instance: ~30 days, archive: ~180 days)
 
-<<<<<<< feature/reporting-address-config-integrity
 ## Dependency contract address integrity
 
 Reporting stores five downstream contract IDs (`remittance_split`, `savings_goals`,
@@ -18,8 +17,8 @@ Reporting stores five downstream contract IDs (`remittance_split`, `savings_goal
 **Validation (on every `configure_addresses` call)**:
 
 - **No self-reference** — None of the five addresses may equal the reporting
-  contract’s own address. Pointing a role at this contract would create ambiguous
-  cross-contract calls and break the intended “one deployment per role” model.
+  contract's own address. Pointing a role at this contract would create ambiguous
+  cross-contract calls and break the intended "one deployment per role" model.
 - **Pairwise uniqueness** — All five values must differ. Two roles must not share
   the same contract ID, or aggregation would silently read the wrong deployment
   twice (audit and correctness risk).
@@ -38,11 +37,10 @@ is rejected.
   its role (that requires off-chain governance / deployment manifests). It only
   enforces **structural** integrity: distinct callees and no reporting
   self-loop.
-- Soroban/Stellar contract IDs are not an EVM-style “zero address”; “malformed”
+- Soroban/Stellar contract IDs are not an EVM-style "zero address"; "malformed"
   in this layer means duplicate or self-reference as above.
-=======
+
 ## Quickstart
->>>>>>> main
 
 ```rust
 // 1. Initialize
@@ -77,15 +75,18 @@ Sets sub-contract addresses. Admin only.
 
 ### Report Generation
 
-#### `get_financial_health_report(user, total_remittance, period_start, period_end) -> FinancialHealthReport`
+#### `get_financial_health_report(user, total_remittance, period_start, period_end) -> Result<FinancialHealthReport, ReportingError>`
 Generates a full report by querying all sub-contracts.
 
-#### `get_remittance_summary(user, total_amount, period_start, period_end) -> RemittanceSummary`
-#### `get_savings_report(user, period_start, period_end) -> SavingsReport`
-#### `get_bill_compliance_report(user, period_start, period_end) -> BillComplianceReport`
-#### `get_insurance_report(user, period_start, period_end) -> InsuranceReport`
+#### `get_remittance_summary(user, total_amount, period_start, period_end) -> Result<RemittanceSummary, ReportingError>`
+#### `get_savings_report(user, period_start, period_end) -> Result<SavingsReport, ReportingError>`
+#### `get_bill_compliance_report(user, period_start, period_end) -> Result<BillComplianceReport, ReportingError>`
+#### `get_insurance_report(user, period_start, period_end) -> Result<InsuranceReport, ReportingError>`
 #### `calculate_health_score(user, total_remittance) -> HealthScore`
 #### `get_trend_analysis(user, current_amount, previous_amount) -> TrendData`
+
+All report generation endpoints validate the period bounds and fail closed with
+`InvalidPeriod` when `period_start > period_end`.
 
 ### Storage
 

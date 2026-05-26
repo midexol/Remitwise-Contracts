@@ -45,13 +45,13 @@ mod testsuit {
                     env.mock_all_auths();
                 }
 
-                let overdue = client.get_overdue_bills(&owner);
+                let overdue = client.get_overdue_bills(&owner, &0, &100);
                 // All overdue bills should have due_date < now
-                for bill in overdue.iter() {
+                for bill in overdue.items.iter() {
                     assert!(bill.due_date < now, "Bill due_date {} not less than now {}", bill.due_date, now);
                 }
                 // The number of overdue bills should match n_overdue
-                assert_eq!(overdue.len(), n_overdue);
+                assert_eq!(overdue.items.len(), n_overdue);
             }
         }
     use crate::*;
@@ -256,8 +256,8 @@ mod testsuit {
         env.mock_all_auths();
         client.pay_bill(&owner, &1);
 
-        let unpaid = client.get_unpaid_bills(&owner);
-        assert_eq!(unpaid.len(), 2);
+        let unpaid = client.get_unpaid_bills(&owner, &0, &100);
+        assert_eq!(unpaid.items.len(), 2);
     }
 
     #[test]
@@ -384,8 +384,8 @@ mod testsuit {
             &String::from_str(&env, "XLM"),
         );
 
-        let overdue = client.get_overdue_bills(&owner);
-        assert_eq!(overdue.len(), 2); // Only first two are overdue
+        let overdue = client.get_overdue_bills(&owner, &0, &100);
+        assert_eq!(overdue.items.len(), 2); // Only first two are overdue
     }
 
     #[test]
@@ -637,7 +637,7 @@ mod testsuit {
 
         // Admin can see all 3 bills
         let all = client.get_all_bills(&admin);
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.items.len(), 3);
     }
     #[test]
     fn test_pay_bill_unauthorized() {
@@ -715,15 +715,15 @@ mod testsuit {
         );
 
         // Verify it shows up in overdue
-        let overdue = client.get_overdue_bills(&owner);
-        assert_eq!(overdue.len(), 1);
+        let overdue = client.get_overdue_bills(&owner, &0, &100);
+        assert_eq!(overdue.items.len(), 1);
 
         // Pay it
         client.pay_bill(&owner, &bill_id);
 
         // Verify it's no longer overdue (because it's paid)
-        let overdue_after = client.get_overdue_bills(&owner);
-        assert_eq!(overdue_after.len(), 0);
+        let overdue_after = client.get_overdue_bills(&owner, &0, &100);
+        assert_eq!(overdue_after.items.len(), 0);
     }
 
     #[test]
@@ -749,6 +749,75 @@ mod testsuit {
 
         let next_bill = client.get_bill(&2).unwrap();
         assert_eq!(next_bill.due_date, 1000000 + 86400); // Exactly 1 day later
+    }
+
+    #[test]
+    fn test_create_bill_invalid_due_dates() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // due_date == 0 should be rejected
+        let res = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Invalid"),
+            &100,
+            &0u64,
+            &false,
+            &0u32,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert_eq!(res, Err(Ok(Error::InvalidDueDate)));
+
+        // due_date <= now should be rejected
+        set_ledger_time(&env, 1, 1_000_000);
+        env.mock_all_auths();
+        let res2 = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Invalid"),
+            &100,
+            &1_000_000u64, // equal to now
+            &false,
+            &0u32,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert_eq!(res2, Err(Ok(Error::InvalidDueDate)));
+    }
+
+    #[test]
+    fn test_recurring_generation_never_in_past() {
+        let env = Env::default();
+        // initial time
+        set_ledger_time(&env, 1, 1_000_000);
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // create recurring bill due shortly after now
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Rent"),
+            &1000,
+            &(1_000_010u64),
+            &true,
+            &30u32,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // advance far into the future so next_due_date would otherwise be in the past
+        set_ledger_time(&env, 2, 2_000_000);
+        env.mock_all_auths();
+        client.pay_bill(&owner, &bill_id).unwrap();
+
+        // The next generated recurring bill (id 2) must have due_date > current time
+        let next_bill = client.get_bill(&2).unwrap();
+        assert!(next_bill.due_date > 2_000_000);
     }
 
     #[test]
@@ -780,9 +849,9 @@ mod testsuit {
             &String::from_str(&env, "XLM"),
         );
 
-        let bills = client.get_all_bills_for_owner(&owner);
-        assert_eq!(bills.len(), 2);
-        for bill in bills.iter() {
+        let bills = client.get_all_bills_for_owner(&owner, &0, &100);
+        assert_eq!(bills.items.len(), 2);
+        for bill in bills.items.iter() {
             assert_eq!(bill.owner, owner);
         }
     }
@@ -828,17 +897,17 @@ mod testsuit {
             &String::from_str(&env, "XLM"),
         );
 
-        let alice_bills = client.get_all_bills_for_owner(&alice);
-        let bob_bills = client.get_all_bills_for_owner(&bob);
+        let alice_bills = client.get_all_bills_for_owner(&alice, &0, &100);
+        let bob_bills = client.get_all_bills_for_owner(&bob, &0, &100);
 
         // Alice sees only her 2 bills
-        assert_eq!(alice_bills.len(), 2);
-        for bill in alice_bills.iter() {
+        assert_eq!(alice_bills.items.len(), 2);
+        for bill in alice_bills.items.iter() {
             assert_eq!(bill.owner, alice, "Alice received a bill she doesn't own");
         }
 
         // Bob sees only his 1 bill
-        assert_eq!(bob_bills.len(), 1);
+        assert_eq!(bob_bills.items.len(), 1);
         assert_eq!(bob_bills.get(0).unwrap().owner, bob);
     }
 
@@ -864,8 +933,8 @@ mod testsuit {
         );
 
         // Bob never created a bill
-        let bob_bills = client.get_all_bills_for_owner(&bob);
-        assert_eq!(bob_bills.len(), 0);
+        let bob_bills = client.get_all_bills_for_owner(&bob, &0, &100);
+        assert_eq!(bob_bills.items.len(), 0);
     }
 
     #[test]
@@ -889,8 +958,8 @@ mod testsuit {
         );
         client.pay_bill(&owner, &bill_id);
 
-        let bills = client.get_all_bills_for_owner(&owner);
-        assert_eq!(bills.len(), 1);
+        let bills = client.get_all_bills_for_owner(&owner, &0, &100);
+        assert_eq!(bills.items.len(), 1);
         assert!(bills.get(0).unwrap().paid);
     }
 
@@ -925,8 +994,8 @@ mod testsuit {
         );
         client.cancel_bill(&owner, &bill_id);
 
-        let bills = client.get_all_bills_for_owner(&owner);
-        assert_eq!(bills.len(), 1);
+        let bills = client.get_all_bills_for_owner(&owner, &0, &100);
+        assert_eq!(bills.items.len(), 1);
         assert_eq!(bills.get(0).unwrap().amount, 200);
     }
 
@@ -1503,17 +1572,17 @@ mod testsuit {
             &String::from_str(&env, "XLM"),
         );
 
-        let alice_overdue = client.get_overdue_bills(&alice);
-        let bob_overdue = client.get_overdue_bills(&bob);
+        let alice_overdue = client.get_overdue_bills(&alice, &0, &100);
+        let bob_overdue = client.get_overdue_bills(&bob, &0, &100);
 
         // Alice sees only her 2 overdue bills, not Bob's
-        assert_eq!(alice_overdue.len(), 2);
-        for bill in alice_overdue.iter() {
+        assert_eq!(alice_overdue.items.len(), 2);
+        for bill in alice_overdue.items.iter() {
             assert_eq!(bill.owner, alice);
         }
 
         // Bob sees only his 1 overdue bill, not Alice's
-        assert_eq!(bob_overdue.len(), 1);
+        assert_eq!(bob_overdue.items.len(), 1);
         assert_eq!(bob_overdue.get(0).unwrap().owner, bob);
     }
 
@@ -2092,7 +2161,7 @@ mod testsuit {
             &0,
         );
 
-        let page = client.get_overdue_bills(&0, &100);
+        let page = client.get_overdue_bills(&owner, &0, &100);
         assert_eq!(
             page.count, 0,
             "Bill must not appear overdue when current_time == due_date"
@@ -2121,12 +2190,12 @@ mod testsuit {
         );
 
         // Not yet overdue at due_date
-        let page = client.get_overdue_bills(&0, &100);
+        let page = client.get_overdue_bills(&owner, &0, &100);
         assert_eq!(page.count, 0);
 
         // Advance one second past due_date
         set_time(&env, due_date + 1);
-        let page = client.get_overdue_bills(&0, &100);
+        let page = client.get_overdue_bills(&owner, &0, &100);
         assert_eq!(
             page.count, 1,
             "Bill must appear overdue exactly one second past due_date"
@@ -2189,7 +2258,7 @@ mod testsuit {
     //     // - Bill 3 (2000010) is > 2000005 (NOT OVERDUE)
     //     env.ledger().set_timestamp(2000005);
 
-    //     let page = client.get_overdue_bills(&0, &100);
+    //     let page = client.get_overdue_bills(&owner, &0, &100);
 
     //     assert_eq!(
     //         page.count, 1,
@@ -2225,12 +2294,12 @@ mod testsuit {
         );
 
         // Still not overdue at due_date
-        let page = client.get_overdue_bills(&0, &100);
+        let page = client.get_overdue_bills(&owner, &0, &100);
         assert_eq!(page.count, 0);
 
         // One full day later – must be overdue
         set_time(&env, due_date + day);
-        let page = client.get_overdue_bills(&0, &100);
+        let page = client.get_overdue_bills(&owner, &0, &100);
         assert_eq!(
             page.count, 1,
             "Bill must be overdue one full day past due_date"
@@ -2894,5 +2963,925 @@ mod testsuit {
 
         let bill = client.get_bill(&id).unwrap();
         assert!(bill.paid);
+    }
+
+    // ========================================================================
+    // Currency Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_create_bill_valid_currency_xlm() {
+        setup_test_env!(env, BillPayments, BillPaymentsClient, client, owner);
+
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Electricity"),
+            &1000,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        assert_eq!(bill_id, 1);
+        let bill = client.get_bill(&1).unwrap();
+        assert_eq!(bill.currency.to_string(), "XLM");
+    }
+
+    #[test]
+    fn test_create_bill_valid_currency_usdc() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "USDC Bill"),
+            &500,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "USDC"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "USDC");
+    }
+
+    #[test]
+    fn test_create_bill_valid_currency_ngn() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "NGN Bill"),
+            &50000,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "NGN"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "NGN");
+    }
+
+    #[test]
+    fn test_create_bill_currency_lowercase_normalized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Lowercase input should be normalized to uppercase
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Lowercase Test"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "xlm"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "XLM");
+    }
+
+    #[test]
+    fn test_create_bill_currency_mixed_case_normalized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Mixed case should be normalized to uppercase
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Mixed Case Test"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "UsDc"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "USDC");
+    }
+
+    #[test]
+    fn test_create_bill_currency_with_whitespace() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency with leading/trailing whitespace should be trimmed
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Whitespace Test"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "  XLM  "),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "XLM");
+    }
+
+    #[test]
+    fn test_create_bill_empty_currency_defaults_to_xlm() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Empty string should default to XLM
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Empty Currency"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, ""),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "XLM");
+    }
+
+    #[test]
+    fn test_create_bill_invalid_currency_with_numbers() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency with numbers should fail
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Invalid Currency"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM1"),
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidCurrency)));
+    }
+
+    #[test]
+    fn test_create_bill_invalid_currency_with_special_chars() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency with special characters should fail
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Invalid Currency"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM!"),
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidCurrency)));
+    }
+
+    #[test]
+    fn test_create_bill_invalid_currency_with_dash() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency with dash should fail
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Invalid Currency"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "US-D"),
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidCurrency)));
+    }
+
+    #[test]
+    fn test_create_bill_invalid_currency_too_long() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency longer than MAX_CURRENCY_LEN should fail
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Too Long Currency"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "VERYLONGCURRENCYCODE"),
+        );
+
+        assert_eq!(result, Err(Ok(Error::InvalidCurrency)));
+    }
+
+    #[test]
+    fn test_create_bill_invalid_currency_only_spaces() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Only whitespace should default to XLM (not fail)
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Spaces Only"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "   "),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "XLM");
+    }
+
+    #[test]
+    fn test_create_bill_valid_currency_eur() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "EUR Bill"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "EUR"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "EUR");
+    }
+
+    #[test]
+    fn test_create_bill_valid_currency_gbp() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "GBP Bill"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "GBP"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "GBP");
+    }
+
+    #[test]
+    fn test_create_bill_valid_currency_jpy() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "JPY Bill"),
+            &10000,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "JPY"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "JPY");
+    }
+
+    #[test]
+    fn test_recurring_bill_preserves_currency() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Recurring USD"),
+            &100,
+            &1000000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "USD"),
+        );
+
+        // Pay the bill to trigger recurring creation
+        env.mock_all_auths();
+        client.pay_bill(&owner, &bill_id);
+
+        // Check original bill
+        let original = client.get_bill(&bill_id).unwrap();
+        assert_eq!(original.currency.to_string(), "USD");
+
+        // Check the new recurring bill
+        let next_bill_id = bill_id + 1;
+        let next_bill = client.get_bill(&next_bill_id).unwrap();
+        assert_eq!(next_bill.currency.to_string(), "USD");
+    }
+
+    #[test]
+    fn test_create_bill_currency_with_leading_spaces() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency with leading spaces should be trimmed
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Leading Spaces"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "  USD"),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "USD");
+    }
+
+    #[test]
+    fn test_create_bill_currency_with_trailing_spaces() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        // Currency with trailing spaces should be trimmed
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Trailing Spaces"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "USD  "),
+        );
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.currency.to_string(), "USD");
+    }
+
+    // -----------------------------------------------------------------------
+    // SC-032: Tag Validation and Canonicalization Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_tags_to_bill_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "TestBill"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "utilities"));
+        tags.push_back(String::from_str(&env, "monthly"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 2);
+        assert_eq!(bill.tags.get(0).unwrap(), String::from_str(&env, "utilities"));
+        assert_eq!(bill.tags.get(1).unwrap(), String::from_str(&env, "monthly"));
+    }
+
+    #[test]
+    fn test_add_tags_to_bill_normalization_uppercase() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "NormalizeTag"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "URGENT-1_Tag"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 1);
+        // Should be normalized to lowercase
+        assert_eq!(bill.tags.get(0).unwrap(), String::from_str(&env, "urgent-1_tag"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tag must be between 1 and 32 characters")]
+    fn test_add_tags_to_bill_empty_tag_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "EmptyTag"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, ""));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+    }
+
+    #[test]
+    #[should_panic(expected = "Tag must be between 1 and 32 characters")]
+    fn test_add_tags_to_bill_too_long_tag_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "LongTag"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "this-is-a-very-long-tag-that-exceeds-32-chars"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_tags_to_bill_invalid_char_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "InvalidChar"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "invalid@tag!"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+    }
+
+    #[test]
+    #[should_panic(expected = "Tags cannot be empty")]
+    fn test_add_tags_to_bill_empty_list_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "EmptyList"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let tags = Vec::new(&env);
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+    }
+
+    #[test]
+    #[should_panic(expected = "Bill not found")]
+    fn test_add_tags_to_bill_not_found_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "test"));
+        client.add_tags_to_bill(&owner, &99999, &tags);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the bill owner can add tags")]
+    fn test_add_tags_to_bill_unauthorized_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let attacker = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Unauthorized"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "test"));
+        client.add_tags_to_bill(&attacker, &bill_id, &tags);
+    }
+
+    #[test]
+    fn test_remove_tags_from_bill_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "RemoveTag"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Add tags
+        let mut add_tags = Vec::new(&env);
+        add_tags.push_back(String::from_str(&env, "tag1"));
+        add_tags.push_back(String::from_str(&env, "tag2"));
+        add_tags.push_back(String::from_str(&env, "tag3"));
+        client.add_tags_to_bill(&owner, &bill_id, &add_tags);
+
+        // Remove one tag
+        let mut remove_tags = Vec::new(&env);
+        remove_tags.push_back(String::from_str(&env, "tag2"));
+        client.remove_tags_from_bill(&owner, &bill_id, &remove_tags);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 2);
+        assert_eq!(bill.tags.get(0).unwrap(), String::from_str(&env, "tag1"));
+        assert_eq!(bill.tags.get(1).unwrap(), String::from_str(&env, "tag3"));
+    }
+
+    #[test]
+    fn test_remove_tags_from_bill_nonexistent_is_noop() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "NoopRemove"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Add tags
+        let mut add_tags = Vec::new(&env);
+        add_tags.push_back(String::from_str(&env, "tag1"));
+        client.add_tags_to_bill(&owner, &bill_id, &add_tags);
+
+        // Try to remove non-existent tag
+        let mut remove_tags = Vec::new(&env);
+        remove_tags.push_back(String::from_str(&env, "nonexistent"));
+        client.remove_tags_from_bill(&owner, &bill_id, &remove_tags);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 1);
+        assert_eq!(bill.tags.get(0).unwrap(), String::from_str(&env, "tag1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Bill not found")]
+    fn test_remove_tags_from_bill_not_found_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "test"));
+        client.remove_tags_from_bill(&owner, &99999, &tags);
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the bill owner can remove tags")]
+    fn test_remove_tags_from_bill_unauthorized_panics() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let attacker = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "UnauthorizedRemove"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Add tags
+        let mut add_tags = Vec::new(&env);
+        add_tags.push_back(String::from_str(&env, "tag1"));
+        client.add_tags_to_bill(&owner, &bill_id, &add_tags);
+
+        // Attacker tries to remove
+        let mut remove_tags = Vec::new(&env);
+        remove_tags.push_back(String::from_str(&env, "tag1"));
+        client.remove_tags_from_bill(&attacker, &bill_id, &remove_tags);
+    }
+
+    #[test]
+    fn test_add_tags_to_bill_all_valid_chars() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "ValidChars"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Test all valid characters: a-z, 0-9, -, _
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "abcdefghijklmnopqrstuvwxyz"));
+        tags.push_back(String::from_str(&env, "0123456789"));
+        tags.push_back(String::from_str(&env, "with-dash"));
+        tags.push_back(String::from_str(&env, "with_underscore"));
+        tags.push_back(String::from_str(&env, "a1-b2_c3"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 5);
+    }
+
+    #[test]
+    fn test_add_tags_to_bill_duplicate_tags_allowed() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "DuplicateTags"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Add duplicate tags
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "duplicate"));
+        tags.push_back(String::from_str(&env, "duplicate"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 2);
+        assert_eq!(bill.tags.get(0).unwrap(), String::from_str(&env, "duplicate"));
+        assert_eq!(bill.tags.get(1).unwrap(), String::from_str(&env, "duplicate"));
+    }
+
+    #[test]
+    fn test_add_tags_to_bill_multiple_batches() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "MultipleBatches"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // First batch
+        let mut tags1 = Vec::new(&env);
+        tags1.push_back(String::from_str(&env, "tag1"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags1);
+
+        // Second batch
+        let mut tags2 = Vec::new(&env);
+        tags2.push_back(String::from_str(&env, "tag2"));
+        tags2.push_back(String::from_str(&env, "tag3"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags2);
+
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert_eq!(bill.tags.len(), 3);
+    }
+
+    #[test]
+    fn test_tags_preserved_on_recurring_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Recurring"),
+            &100,
+            &1000000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Add tags
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "recurring"));
+        tags.push_back(String::from_str(&env, "monthly"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+
+        // Pay the bill
+        client.pay_bill(&owner, &bill_id);
+
+        // Check next recurring bill has tags
+        let next_bill_id = 2u32;
+        let next_bill = client.get_bill(&next_bill_id).unwrap();
+        assert_eq!(next_bill.tags.len(), 2);
+        assert_eq!(next_bill.tags.get(0).unwrap(), String::from_str(&env, "recurring"));
+        assert_eq!(next_bill.tags.get(1).unwrap(), String::from_str(&env, "monthly"));
+    }
+
+    #[test]
+    fn test_tags_preserved_on_archive() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Archive"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+
+        // Add tags
+        let mut tags = Vec::new(&env);
+        tags.push_back(String::from_str(&env, "archived"));
+        client.add_tags_to_bill(&owner, &bill_id, &tags);
+
+        // Pay the bill
+        client.pay_bill(&owner, &bill_id);
+
+        // Archive
+        client.archive_paid_bills(&owner, &u64::MAX);
+
+        // Check archived bill has tags
+        let archived = client.get_archived_bill(&bill_id).unwrap();
+        assert_eq!(archived.tags.len(), 1);
+        assert_eq!(archived.tags.get(0).unwrap(), String::from_str(&env, "archived"));
     }
 }

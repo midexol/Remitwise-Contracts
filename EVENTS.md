@@ -200,6 +200,9 @@ pub struct VersionUpgradeEvent {
 ```rust
 pub struct GoalCreatedEvent {
     pub goal_id: u32,               // Unique goal ID
+    pub owner: Address,             // Goal owner address
+    pub amount: i128,               // Initial amount (always 0)
+    pub new_total: i128,            // Initial total (always 0)
     pub name: String,               // Goal name (e.g., "Emergency Fund")
     pub target_amount: i128,        // Target amount in stroops
     pub target_date: u64,           // Target completion date (Unix timestamp)
@@ -211,6 +214,9 @@ pub struct GoalCreatedEvent {
 ```json
 {
   "goal_id": 1,
+  "owner": "G...",
+  "amount": 0,
+  "new_total": 0,
   "name": "Emergency Fund",
   "target_amount": 50000,
   "target_date": 1735689600,
@@ -227,6 +233,7 @@ pub struct GoalCreatedEvent {
 ```rust
 pub struct FundsAddedEvent {
     pub goal_id: u32,               // Goal ID
+    pub owner: Address,             // Goal owner
     pub amount: i128,               // Amount added in stroops
     pub new_total: i128,            // New total in goal
     pub timestamp: u64,             // Event timestamp
@@ -237,6 +244,7 @@ pub struct FundsAddedEvent {
 ```json
 {
   "goal_id": 1,
+  "owner": "G...",
   "amount": 5000,
   "new_total": 15000,
   "timestamp": 1234567850
@@ -244,33 +252,60 @@ pub struct FundsAddedEvent {
 ```
 
 ### Event: Goal Completed
-
-**Topic:** `"completed"` (primary)  
-**Secondary Topic:** `("savings", SavingsEvent::GoalCompleted)`
-
-**Data Structure:**
-```rust
-pub struct GoalCompletedEvent {
-    pub goal_id: u32,               // Goal ID
-    pub name: String,               // Goal name
-    pub final_amount: i128,         // Final amount in goal
-    pub timestamp: u64,             // Event timestamp
-}
-```
+ 
+ **Topic:** `"completed"` (primary)  
+ **Secondary Topic:** `("savings", SavingsEvent::GoalCompleted)`
+ 
+ **Data Structure:**
+ ```rust
+ pub struct GoalCompletedEvent {
+     pub goal_id: u32,               // Goal ID
+     pub owner: Address,             // Goal owner
+     pub amount: i128,               // Final contribution amount
+     pub new_total: i128,            // Total amount reached
+     pub name: String,               // Goal name
+     pub timestamp: u64,             // Event timestamp
+ }
+ ```
+ 
+ **Example Event:**
+ ```json
+ {
+   "goal_id": 1,
+   "owner": "G...",
+   "amount": 5000,
+   "new_total": 50000,
+   "name": "Emergency Fund",
+   "timestamp": 1234567860
+ }
+ ```
 
 ### Event: Funds Withdrawn
-
-**Topic:** `("savings", SavingsEvent::FundsWithdrawn)`
-
-**Data Structure:**
-```rust
-pub struct FundsWithdrawnEvent {
-    pub goal_id: u32,               // Goal ID
-    pub amount: i128,               // Amount withdrawn
-    pub remaining: i128,            // Remaining amount
-    pub timestamp: u64,             // Event timestamp
-}
-```
+ 
+ **Topic:** `"withdrawn"` (primary)
+ **Secondary Topic:** `("savings", SavingsEvent::FundsWithdrawn)`
+ 
+ **Data Structure:**
+ ```rust
+ pub struct FundsWithdrawnEvent {
+     pub goal_id: u32,               // Goal ID
+     pub owner: Address,             // Goal owner
+     pub amount: i128,               // Amount withdrawn
+     pub new_total: i128,            // New total remaining in goal
+     pub timestamp: u64,             // Event timestamp
+ }
+ ```
+ 
+ **Example Event:**
+ ```json
+ {
+   "goal_id": 1,
+   "owner": "G...",
+   "amount": 2000,
+   "new_total": 13000,
+   "timestamp": 1234567900
+ }
+ ```
 
 ### Event: Goal Locked/Unlocked
 
@@ -848,6 +883,47 @@ When upgrading contracts:
 2. Old event types continue to be emitted for backward compatibility
 3. Indexers can subscribe to both old and new topics during transition period
 4. After deprecation period, old events may be phased out (announced in advance)
+
+### Schema Stability Tests
+
+The schema documented above is enforced in CI by per-contract test modules
+named `events_schema_test`. Each module pins down three things:
+
+1. **Topic symbols** — every `symbol_short!()` literal that appears in a
+   topic tuple is asserted equal to its documented value.
+2. **Payload field set, names, and types** — every event struct is built via
+   a struct literal naming each field (which fails to compile if a field is
+   added, removed, or renamed) and round-tripped through `Val` to verify the
+   on-wire serialization is preserved.
+3. **Enum variant set and discriminants** — every event enum's variants are
+   listed by name and (where stable discriminants matter) compared against
+   their documented `as u32` value.
+
+Run them locally:
+
+```bash
+cargo test --workspace events_schema_test
+```
+
+Per-contract:
+
+| Contract | Test module |
+|----------|-------------|
+| `bill_payments` | [bill_payments/src/events_schema_test.rs](bill_payments/src/events_schema_test.rs) |
+| `family_wallet` | [family_wallet/src/events_schema_test.rs](family_wallet/src/events_schema_test.rs) |
+| `remittance_split` | [remittance_split/src/events_schema_test.rs](remittance_split/src/events_schema_test.rs) |
+| `reporting` | [reporting/src/events_schema_test.rs](reporting/src/events_schema_test.rs) |
+| `savings_goals` | [savings_goals/src/events_schema_test.rs](savings_goals/src/events_schema_test.rs) |
+
+A failing schema test is the signal that **a change is breaking for indexers**.
+The required workflow is:
+
+1. Bump the contract's major version.
+2. Update `EVENTS.md` to document the old and new shapes side-by-side.
+3. Update the test to reflect the new schema *as a separate commit on top
+   of the version bump*, so reviewers can audit the diff in isolation.
+4. Coordinate with downstream indexer owners before the upgrade event is
+   emitted on mainnet.
 
 ---
 

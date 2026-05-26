@@ -30,6 +30,10 @@ const MAX_BATCH_MEMBERS: u32 = 50;
 
 // Access audit bounds
 const MAX_ACCESS_AUDIT_ENTRIES: u32 = 200;
+const MAX_AUDIT_PAGE_LIMIT: u32 = 50;
+const DEFAULT_AUDIT_PAGE_LIMIT: u32 = 20;
+const MAX_PENDING_PAGE_LIMIT: u32 = 100;
+const DEFAULT_PENDING_PAGE_LIMIT: u32 = 20;
 
 #[contracttype]
 #[derive(Clone)]
@@ -39,6 +43,14 @@ pub struct AccessAuditEntry {
     pub target: Option<Address>,
     pub success: bool,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AccessAuditPage {
+    pub items: Vec<AccessAuditEntry>,
+    pub next_cursor: u32,
+    pub count: u32,
 }
 
 #[contracttype]
@@ -71,6 +83,14 @@ pub struct PendingTransaction {
     pub created_at: u64,
     pub expires_at: u64,
     pub data: TransactionData,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingTxPage {
+    pub items: Vec<PendingTransaction>,
+    pub next_cursor: u64,
+    pub count: u32,
 }
 
 #[contracttype]
@@ -257,27 +277,25 @@ pub enum Error {
     DuplicateSigner = 18,
     TooManySigners = 19,
     InvalidPrecisionConfig = 20,
+    InvalidProposalExpiry = 21,
+    MemberAlreadyExists = 22,
 }
 
 #[contractimpl]
 impl FamilyWallet {
     pub fn init(env: Env, owner: Address, initial_members: Vec<Address>) -> bool {
         owner.require_auth();
-
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
         if existing.is_some() {
             panic!("Wallet already initialized");
         }
-
         Self::extend_instance_ttl(&env);
-
         env.storage()
             .instance()
             .set(&symbol_short!("OWNER"), &owner);
 
         let mut members: Map<Address, FamilyMember> = Map::new(&env);
         let timestamp = env.ledger().timestamp();
-
         members.set(
             owner.clone(),
             FamilyMember {
@@ -288,7 +306,6 @@ impl FamilyWallet {
                 added_at: timestamp,
             },
         );
-
         for member_addr in initial_members.iter() {
             members.set(
                 member_addr.clone(),
@@ -301,7 +318,6 @@ impl FamilyWallet {
                 },
             );
         }
-
         env.storage()
             .instance()
             .set(&symbol_short!("MEMBERS"), &members);
@@ -328,7 +344,6 @@ impl FamilyWallet {
             &symbol_short!("PEND_TXS"),
             &Map::<u64, PendingTransaction>::new(&env),
         );
-
         env.storage().instance().set(
             &symbol_short!("EXEC_TXS"),
             &Map::<u64, ExecutedTxMeta>::new(&env),
@@ -337,7 +352,6 @@ impl FamilyWallet {
         env.storage()
             .instance()
             .set(&symbol_short!("NEXT_TX"), &1u64);
-
         let em_config = EmergencyConfig {
             max_amount: 10000_0000000,
             cooldown: 3600,
@@ -368,7 +382,6 @@ impl FamilyWallet {
     ) -> Result<bool, Error> {
         admin.require_auth();
         Self::require_not_paused(&env);
-
         if role == FamilyRole::Owner {
             return Err(Error::InvalidRole);
         }
@@ -386,7 +399,7 @@ impl FamilyWallet {
             .unwrap_or_else(|| panic!("Wallet not initialized"));
 
         if members.get(member_address.clone()).is_some() {
-            return Err(Error::InvalidRole);
+            return Err(Error::MemberAlreadyExists);
         }
 
         Self::extend_instance_ttl(&env);
@@ -732,7 +745,6 @@ impl FamilyWallet {
 
         tx_id
     }
-
     pub fn sign_transaction(env: Env, signer: Address, tx_id: u64) -> bool {
         signer.require_auth();
         Self::require_not_paused(&env);
@@ -1153,6 +1165,69 @@ impl FamilyWallet {
             .unwrap_or_else(|| panic!("Pending transactions map not initialized"));
 
         pending_txs.get(tx_id)
+    }
+
+    /// Paginated listing of pending multisig proposals.
+    ///
+    /// - `caller` must be authenticated.
+    /// - Owner/Admin may list all pending proposals.
+    /// - Regular members may only list proposals they proposed.
+    ///
+    /// Cursor is the last-seen `tx_id`. Pass `0` for the first page.
+    pub fn get_pending_transactions_page(
+        env: Env,
+        caller: Address,
+        cursor: u64,
+        limit: u32,
+    ) -> PendingTxPage {
+        caller.require_auth();
+
+        let capped_limit = if limit == 0 {
+            DEFAULT_PENDING_PAGE_LIMIT
+        } else {
+            limit.min(MAX_PENDING_PAGE_LIMIT)
+        };
+
+        let pending_txs: Map<u64, PendingTransaction> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PEND_TXS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let next_tx: u64 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("NEXT_TX"))
+            .unwrap_or(1u64);
+
+        let mut items: Vec<PendingTransaction> = Vec::new(&env);
+
+        let mut id = cursor.saturating_add(1);
+        let mut last_returned: u64 = 0;
+        let is_admin = Self::is_owner_or_admin(&env, &caller);
+
+        while id < next_tx && items.len() < capped_limit {
+            if let Some(tx) = pending_txs.get(id) {
+                if is_admin || tx.proposer == caller {
+                    items.push_back(tx.clone());
+                    last_returned = id;
+                }
+            }
+            id = id.saturating_add(1);
+        }
+
+        let next_cursor = if id < next_tx && last_returned != 0 {
+            last_returned
+        } else {
+            0u64
+        };
+        let count = items.len();
+
+        PendingTxPage {
+            items,
+            next_cursor,
+            count,
+        }
     }
 
     pub fn get_multisig_config(env: Env, tx_type: TransactionType) -> Option<MultiSigConfig> {
@@ -1602,6 +1677,9 @@ impl FamilyWallet {
     }
 
     /// Set the multisig proposal expiry window in seconds.
+    ///
+    /// # Security
+    /// Only the Owner can set this value, and their role must not be expired.
     pub fn set_proposal_expiry(env: Env, caller: Address, expiry: u64) -> bool {
         caller.require_auth();
         let owner: Address = env
@@ -1609,12 +1687,17 @@ impl FamilyWallet {
             .instance()
             .get(&symbol_short!("OWNER"))
             .unwrap_or_else(|| panic!("Wallet not initialized"));
+
+        // Verify caller is owner AND role is not expired
         if caller != owner {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        if Self::role_has_expired(&env, &caller) {
+            panic!("Role has expired");
+        }
 
         if expiry == 0 || expiry > MAX_PROPOSAL_EXPIRY {
-            panic_with_error!(&env, Error::ThresholdAboveMaximum);
+            panic_with_error!(&env, Error::InvalidProposalExpiry);
         }
 
         env.storage()
@@ -1954,6 +2037,46 @@ impl FamilyWallet {
         out
     }
 
+    // Owner/Admin only: audit data is privacy-sensitive — reveals who accessed
+    // what and when, so Members are excluded from reading the full trail.
+    pub fn get_access_audit_page(
+        env: Env,
+        caller: Address,
+        from_index: u32,
+        limit: u32,
+    ) -> AccessAuditPage {
+        caller.require_auth();
+        Self::require_role_at_least(&env, &caller, FamilyRole::Admin);
+
+        let entries: Vec<AccessAuditEntry> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ACC_AUDIT"))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let capped_limit = if limit == 0 {
+            DEFAULT_AUDIT_PAGE_LIMIT
+        } else {
+            limit.min(MAX_AUDIT_PAGE_LIMIT)
+        };
+        let total = entries.len();
+        let mut items = Vec::new(&env);
+        let mut i = from_index;
+        while i < total && items.len() < capped_limit {
+            if let Some(e) = entries.get(i) {
+                items.push_back(e);
+            }
+            i += 1;
+        }
+        let count = items.len();
+        let next_cursor = if i < total { i } else { 0 };
+        AccessAuditPage {
+            items,
+            next_cursor,
+            count,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -2207,6 +2330,21 @@ impl FamilyWallet {
         }
     }
 
+    /// Helper to enforce role expiry on admin-level operations.
+    ///
+    /// Combines authorization check with expiry validation in a single call,
+    /// ensuring expired admins cannot perform privileged operations.
+    /// This helper is documented as a pattern for future admin-gated operations.
+    #[allow(dead_code)]
+    fn require_not_expired_admin(env: &Env, caller: &Address) {
+        if !Self::is_owner_or_admin(env, caller) {
+            panic!("Only Owner or Admin can perform this operation");
+        }
+        if Self::role_has_expired(env, caller) {
+            panic!("Role has expired");
+        }
+    }
+
     fn append_access_audit(
         env: &Env,
         operation: Symbol,
@@ -2316,5 +2454,7 @@ impl FamilyWallet {
     }
 }
 
+#[cfg(test)]
+mod events_schema_test;
 #[cfg(test)]
 mod test;
