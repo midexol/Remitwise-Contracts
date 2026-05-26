@@ -387,24 +387,29 @@ pub struct PolicyCreatedEvent {
 ### Event: Premium Paid
 
 **Topic:** `"paid"` (primary)  
-**Secondary Topic:** `("insure", InsuranceEvent::PremiumPaid)`
+**Secondary Topic:** `("Remitwise", EventCategory::Transaction, EventPriority::Low, "paid")`
 
 **Data Structure:**
 ```rust
 pub struct PremiumPaidEvent {
     pub policy_id: u32,             // Policy ID
-    pub name: String,               // Policy name
+    pub owner: Address,             // Policy owner
     pub amount: i128,               // Premium amount paid
-    pub next_payment_date: u64,     // Next payment due date
+    pub next_payment_date: u64,     // Next due date after cadence advancement
     pub timestamp: u64,             // Event timestamp
 }
 ```
+
+**Cadence Rule:**
+- Fixed 30-day cadence (`30 * 86_400` seconds).
+- `pay_premium` and `batch_pay_premiums` both advance per-policy due dates.
+- Late payments always produce `next_payment_date` strictly in the future.
 
 **Example Event:**
 ```json
 {
   "policy_id": 1,
-  "name": "Life Insurance",
+  "owner": "G...",
   "amount": 2000,
   "next_payment_date": 1237246200,
   "timestamp": 1234567850

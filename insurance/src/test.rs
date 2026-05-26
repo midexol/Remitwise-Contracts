@@ -7,6 +7,7 @@ use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     Address, Env, String, TryFromVal, Val, Vec as SorobanVec,
 };
+use std::vec::Vec as StdVec;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -161,7 +162,7 @@ fn test_pay_premium_advances_next_payment_date() {
     client.pay_premium(&owner, &id);
 
     let policy = client.get_policy(&id).unwrap();
-    assert_eq!(policy.next_payment_date, 2_000_000 + 30 * 86_400);
+    assert_eq!(policy.next_payment_date, 1_000_000 + 60 * 86_400);
 }
 
 #[test]
@@ -635,6 +636,95 @@ fn test_get_active_policies_zero_limit_uses_default() {
     assert_eq!(page.count, 1);
 }
 
+#[test]
+fn test_get_active_policies_ordered_sparse_and_termination() {
+    let (env, client, _) = setup();
+    let owner = Address::generate(&env);
+
+    let id1 = create_health_policy(&env, &client, &owner);
+    let id2 = create_health_policy(&env, &client, &owner);
+    let id3 = create_health_policy(&env, &client, &owner);
+    let id4 = create_health_policy(&env, &client, &owner);
+    let id5 = create_health_policy(&env, &client, &owner);
+
+    // Create sparse active IDs by deactivating middle entries.
+    client.deactivate_policy(&owner, &id2);
+    client.deactivate_policy(&owner, &id4);
+
+    let p1 = client.get_active_policies(&owner, &0, &2);
+    assert_eq!(p1.count, 2);
+    assert_eq!(p1.items.get(0).unwrap().id, id1);
+    assert_eq!(p1.items.get(1).unwrap().id, id3);
+    assert_eq!(p1.next_cursor, id3);
+
+    let p2 = client.get_active_policies(&owner, &p1.next_cursor, &2);
+    assert_eq!(p2.count, 1);
+    assert_eq!(p2.items.get(0).unwrap().id, id5);
+    assert_eq!(p2.next_cursor, 0);
+}
+
+#[test]
+fn test_get_active_policies_limit_clamps_to_max() {
+    let (env, client, _) = setup();
+    let owner = Address::generate(&env);
+
+    for _ in 0..MAX_PAGE_LIMIT {
+        create_health_policy(&env, &client, &owner);
+    }
+
+    let page = client.get_active_policies(&owner, &0, &(MAX_PAGE_LIMIT + 500));
+    assert_eq!(page.count, MAX_PAGE_LIMIT);
+    assert_eq!(page.next_cursor, 0);
+}
+
+#[test]
+fn test_get_active_policies_full_traversal_no_duplicates_or_skips() {
+    let (env, client, _) = setup();
+    let owner = Address::generate(&env);
+
+    let mut all_ids: StdVec<u32> = StdVec::new();
+    for _ in 0..10 {
+        all_ids.push(create_health_policy(&env, &client, &owner));
+    }
+
+    // Introduce sparse IDs in active set.
+    client.deactivate_policy(&owner, &all_ids[1]);
+    client.deactivate_policy(&owner, &all_ids[6]);
+
+    let mut expected_active: StdVec<u32> = all_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != all_ids[1] && *id != all_ids[6])
+        .collect();
+    expected_active.sort();
+
+    let mut seen: StdVec<u32> = StdVec::new();
+    let mut cursor = 0u32;
+
+    loop {
+        let page = client.get_active_policies(&owner, &cursor, &3);
+
+        let mut prev = cursor;
+        for item in page.items.iter() {
+            assert!(item.id > prev, "page IDs must be strictly ascending");
+            prev = item.id;
+            seen.push(item.id);
+        }
+
+        if page.next_cursor == 0 {
+            break;
+        }
+        assert!(page.next_cursor > cursor, "next_cursor must be monotonic");
+        cursor = page.next_cursor;
+    }
+
+    seen.sort();
+    assert_eq!(
+        seen, expected_active,
+        "traversal must visit each active policy exactly once"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // get_total_monthly_premium — tests
 // ---------------------------------------------------------------------------
@@ -823,7 +913,7 @@ fn test_premium_paid_event_schema() {
     assert_eq!(data.amount, 1_000i128, "payload.amount mismatch");
     assert_eq!(
         data.next_payment_date,
-        2_000_000 + 30 * 86_400,
+        1_000_000 + 60 * 86_400,
         "payload.next_payment_date mismatch"
     );
     assert_eq!(data.timestamp, 2_000_000u64, "payload.timestamp mismatch");
@@ -1076,6 +1166,6 @@ fn test_batch_premium_paid_event_payload_schema() {
     assert_eq!(data.policy_id, id);
     assert_eq!(data.owner, owner);
     assert_eq!(data.amount, 1_000i128);
-    assert_eq!(data.next_payment_date, 2_000_000 + 30 * 86_400);
+    assert_eq!(data.next_payment_date, 1_000_000 + 60 * 86_400);
     assert_eq!(data.timestamp, 2_000_000u64);
 }
