@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use remitwise_common::{EventCategory, EventPriority};
 use soroban_sdk::{
