@@ -1019,6 +1019,22 @@ impl SavingsGoalContract {
         Ok(new_total)
     }
 
+    /// Adds contributions to multiple goals in one call.
+    ///
+    /// Batch semantics are strict and order-sensitive:
+    /// * `contributions.len()` must be at most `MAX_BATCH_SIZE` (50)
+    /// * each `ContributionItem.amount` must be strictly positive
+    /// * duplicate `goal_id` values are allowed and are applied sequentially
+    ///   against the updated balance from earlier items in the same batch
+    /// * per-item balance updates use checked arithmetic and return
+    ///   `SavingsGoalError::Overflow` instead of allowing a host-level panic
+    ///
+    /// # Errors
+    /// * `BatchTooLarge` - If more than 50 contributions are supplied
+    /// * `InvalidAmount` - If any contribution amount is `<= 0`
+    /// * `GoalNotFound` - If any referenced goal does not exist
+    /// * `Unauthorized` - If the caller does not own a referenced goal
+    /// * `Overflow` - If any balance update would overflow i128
     pub fn batch_add_to_goals(
         env: Env,
         caller: Address,
@@ -1054,6 +1070,8 @@ impl SavingsGoalContract {
             }
 
             let previously_completed = goal.current_amount >= goal.target_amount;
+            // Checked arithmetic keeps overflow as a contract error instead of
+            // a panic-abort when balances approach the i128 boundary.
             let new_total = match goal.current_amount.checked_add(item.amount) {
                 Some(v) => v,
                 None => return Err(SavingsGoalError::Overflow),
