@@ -26,7 +26,8 @@ const MIN_THRESHOLD: u32 = 1;
 const MAX_SIGNERS: u32 = 20;
 
 // Batch bounds
-const MAX_BATCH_MEMBERS: u32 = 50;
+const MAX_BATCH_MEMBERS: u32 = 30;
+const MAX_FAMILY_MEMBERS: u32 = MAX_BATCH_MEMBERS;
 
 // Access audit bounds
 const MAX_ACCESS_AUDIT_ENTRIES: u32 = 200;
@@ -1959,33 +1960,61 @@ impl FamilyWallet {
         true
     }
 
+    /// Add a batch of family members atomically.
+    ///
+    /// Semantics:
+    /// - The whole batch succeeds or the whole batch fails.
+    /// - Empty batches are accepted and return `0`.
+    /// - Any duplicate address in the batch, pre-existing member, owner-role item,
+    ///   or batch that would exceed the family-member cap aborts the entire call.
+    /// - On success, the return value is the number of members added.
     pub fn batch_add_family_members(
         env: Env,
         caller: Address,
         members: Vec<BatchMemberItem>,
     ) -> u32 {
         caller.require_auth();
-        RemitwiseEvents::emit(
-            &env,
-            EventCategory::Access,
-            EventPriority::Medium,
-            symbol_short!("batch_mem"),
-            members.len(),
-        );
         Self::require_role_at_least(&env, &caller, FamilyRole::Admin);
         Self::require_not_paused(&env);
+        if members.len() > MAX_BATCH_MEMBERS {
+            panic!("Batch too large");
+        }
         Self::extend_instance_ttl(&env);
+
         let mut members_map: Map<Address, FamilyMember> = env
             .storage()
             .instance()
             .get(&symbol_short!("MEMBERS"))
             .unwrap_or_else(|| panic!("Wallet not initialized"));
-        let timestamp = env.ledger().timestamp();
-        let mut count = 0u32;
+
+        let mut current_member_count = 0u32;
+        for _ in members_map.iter() {
+            current_member_count += 1;
+        }
+
+        let mut seen_addrs: Map<Address, bool> = Map::new(&env);
+        let mut additions = 0u32;
         for item in members.iter() {
             if item.role == FamilyRole::Owner {
                 panic!("Cannot add Owner via batch");
             }
+            if seen_addrs.get(item.address.clone()).is_some() {
+                panic!("Duplicate member in batch");
+            }
+            seen_addrs.set(item.address.clone(), true);
+            if members_map.get(item.address.clone()).is_some() {
+                panic!("Member already exists");
+            }
+            additions += 1;
+        }
+
+        if current_member_count + additions > MAX_FAMILY_MEMBERS {
+            panic!("Member cap exceeded");
+        }
+
+        let timestamp = env.ledger().timestamp();
+        let mut count = 0u32;
+        for item in members.iter() {
             members_map.set(
                 item.address.clone(),
                 FamilyMember {
@@ -2008,10 +2037,25 @@ impl FamilyWallet {
         env.storage()
             .instance()
             .set(&symbol_short!("MEMBERS"), &members_map);
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Access,
+            EventPriority::Medium,
+            symbol_short!("batch_mem"),
+            count,
+        );
         Self::update_storage_stats(&env);
         count
     }
 
+    /// Remove a batch of family members atomically.
+    ///
+    /// Semantics:
+    /// - The whole batch succeeds or the whole batch fails.
+    /// - Empty batches are accepted and return `0`.
+    /// - Any duplicate address in the batch, missing member, or attempt to remove
+    ///   the owner aborts the entire call.
+    /// - On success, the return value is the number of members removed.
     pub fn batch_remove_family_members(env: Env, caller: Address, addresses: Vec<Address>) -> u32 {
         caller.require_auth();
         Self::require_role_at_least(&env, &caller, FamilyRole::Owner);
@@ -2033,22 +2077,32 @@ impl FamilyWallet {
             .instance()
             .get(&symbol_short!("MEMBERS"))
             .unwrap_or_else(|| panic!("Wallet not initialized"));
-        let mut count = 0u32;
+
+        let mut seen_addrs: Map<Address, bool> = Map::new(&env);
         for addr in addresses.iter() {
             if addr.clone() == owner {
                 panic!("Cannot remove owner");
             }
-            if members_map.get(addr.clone()).is_some() {
-                members_map.remove(addr.clone());
-                Self::append_access_audit(
-                    &env,
-                    symbol_short!("rem_mem"),
-                    &caller,
-                    Some(addr.clone()),
-                    true,
-                );
-                count += 1;
+            if seen_addrs.get(addr.clone()).is_some() {
+                panic!("Duplicate member in batch");
             }
+            seen_addrs.set(addr.clone(), true);
+            if members_map.get(addr.clone()).is_none() {
+                panic!("Member not found");
+            }
+        }
+
+        let mut count = 0u32;
+        for addr in addresses.iter() {
+            members_map.remove(addr.clone());
+            Self::append_access_audit(
+                &env,
+                symbol_short!("rem_mem"),
+                &caller,
+                Some(addr.clone()),
+                true,
+            );
+            count += 1;
         }
         env.storage()
             .instance()

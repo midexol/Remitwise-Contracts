@@ -2921,6 +2921,157 @@ fn test_expired_owner_cannot_batch_remove_members() {
     assert!(result.is_err());
 }
 
+fn generate_addresses(env: &Env, count: u32) -> Vec<Address> {
+    let mut addresses = Vec::new(env);
+    for _ in 0..count {
+        addresses.push_back(Address::generate(env));
+    }
+    addresses
+}
+
+#[test]
+fn test_batch_add_family_members_all_valid_and_empty_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = vec![&env, Address::generate(&env), Address::generate(&env)];
+    client.init(&owner, &initial_members);
+
+    let member_a = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let members_to_add = vec![
+        &env,
+        BatchMemberItem {
+            address: member_a.clone(),
+            role: FamilyRole::Member,
+        },
+        BatchMemberItem {
+            address: member_b.clone(),
+            role: FamilyRole::Admin,
+        },
+    ];
+
+    let added = client.batch_add_family_members(&owner, &members_to_add);
+    assert_eq!(added, 2);
+    assert_eq!(client.get_family_member(&member_a).unwrap().role, FamilyRole::Member);
+    assert_eq!(client.get_family_member(&member_b).unwrap().role, FamilyRole::Admin);
+
+    let empty_batch = Vec::new(&env);
+    assert_eq!(client.batch_add_family_members(&owner, &empty_batch), 0);
+}
+
+#[test]
+fn test_batch_add_family_members_rejects_mixed_batch_without_partial_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let existing_member = Address::generate(&env);
+    client.init(&owner, &vec![&env, existing_member.clone()]);
+
+    let new_member = Address::generate(&env);
+    let members_to_add = vec![
+        &env,
+        BatchMemberItem {
+            address: new_member.clone(),
+            role: FamilyRole::Member,
+        },
+        BatchMemberItem {
+            address: existing_member.clone(),
+            role: FamilyRole::Admin,
+        },
+    ];
+
+    let result = client.try_batch_add_family_members(&owner, &members_to_add);
+    assert!(result.is_err());
+    assert!(client.get_family_member(&new_member).is_none());
+    assert_eq!(client.get_family_member(&existing_member).unwrap().role, FamilyRole::Member);
+}
+
+#[test]
+fn test_batch_add_family_members_rejects_duplicate_and_cap_excess() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = generate_addresses(&env, 28);
+    client.init(&owner, &initial_members);
+
+    let duplicate_member = Address::generate(&env);
+    let duplicate_batch = vec![
+        &env,
+        BatchMemberItem {
+            address: duplicate_member.clone(),
+            role: FamilyRole::Member,
+        },
+        BatchMemberItem {
+            address: duplicate_member.clone(),
+            role: FamilyRole::Admin,
+        },
+    ];
+
+    let duplicate_result = client.try_batch_add_family_members(&owner, &duplicate_batch);
+    assert!(duplicate_result.is_err());
+    assert!(client.get_family_member(&duplicate_member).is_none());
+
+    let cap_member_a = Address::generate(&env);
+    let cap_member_b = Address::generate(&env);
+    let cap_batch = vec![
+        &env,
+        BatchMemberItem {
+            address: cap_member_a.clone(),
+            role: FamilyRole::Member,
+        },
+        BatchMemberItem {
+            address: cap_member_b.clone(),
+            role: FamilyRole::Member,
+        },
+    ];
+
+    let cap_result = client.try_batch_add_family_members(&owner, &cap_batch);
+    assert!(cap_result.is_err());
+    assert!(client.get_family_member(&cap_member_a).is_none());
+    assert!(client.get_family_member(&cap_member_b).is_none());
+}
+
+#[test]
+fn test_batch_remove_family_members_rejects_missing_and_duplicate_without_partial_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member_a = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    client.init(&owner, &vec![&env, member_a.clone(), member_b.clone()]);
+
+    let missing_member = Address::generate(&env);
+    let mixed_remove = vec![&env, member_a.clone(), missing_member.clone()];
+
+    let mixed_result = client.try_batch_remove_family_members(&owner, &mixed_remove);
+    assert!(mixed_result.is_err());
+    assert!(client.get_family_member(&member_a).is_some());
+    assert!(client.get_family_member(&member_b).is_some());
+
+    let duplicate_remove = vec![&env, missing_member.clone(), missing_member.clone()];
+    let duplicate_result = client.try_batch_remove_family_members(&owner, &duplicate_remove);
+    assert!(duplicate_result.is_err());
+
+    let all_invalid = vec![&env, Address::generate(&env), Address::generate(&env)];
+    let invalid_result = client.try_batch_remove_family_members(&owner, &all_invalid);
+    assert!(invalid_result.is_err());
+    assert!(client.get_family_member(&member_a).is_some());
+    assert!(client.get_family_member(&member_b).is_some());
+}
+
 #[test]
 fn test_expired_owner_cannot_set_proposal_expiry() {
     let env = Env::default();
