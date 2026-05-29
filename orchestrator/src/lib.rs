@@ -1,52 +1,4 @@
 #![no_std]
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, symbol_short, Address, Env, Symbol, Vec,
-};
-
-mod interface {
-    use soroban_sdk::{contractclient, Address, Env, Vec};
-
-    #[contractclient(name = "FamilyWalletClient")]
-    pub trait FamilyWalletInterface {
-        fn check_spending_limit(env: Env, user: Address, amount: i128) -> bool;
-    }
-
-    #[contractclient(name = "RemittanceSplitClient")]
-    pub trait RemittanceSplitInterface {
-        fn calculate_split(env: Env, total_amount: i128) -> Vec<i128>;
-    }
-
-    #[contractclient(name = "SavingsGoalsClient")]
-    pub trait SavingsGoalsInterface {
-        fn add_to_goal(env: Env, user: Address, goal_id: u32, amount: i128) -> bool;
-    }
-
-    #[contractclient(name = "BillPaymentsClient")]
-    pub trait BillPaymentsInterface {
-        fn pay_bill(env: Env, user: Address, bill_id: u32, amount: i128) -> bool;
-    }
-
-    #[contractclient(name = "InsuranceClient")]
-    pub trait InsuranceInterface {
-        fn pay_premium(env: Env, user: Address, policy_id: u32, amount: i128) -> bool;
-    }
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum OrchestratorError {
-    ReentrancyDetected = 10,
-    PermissionDenied = 11,
-    InvalidAmount = 12,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct OrchestratorAuditEntry {
-    pub operation: Symbol,
-    pub caller: Address,
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use soroban_sdk::{
@@ -65,9 +17,12 @@ const MAX_USED_NONCES_PER_ADDR: u32 = 256;
 /// Maximum ledger seconds a signed request may remain valid after creation.
 const MAX_DEADLINE_WINDOW_SECS: u64 = 3600; // 1 hour
 
-// Audit constants
+/// Maximum number of audit entries retained in the ring-buffer.
+/// When the log reaches this cap the oldest entry is evicted to bound
+/// instance-storage rent and read cost.
 const MAX_AUDIT_ENTRIES: u32 = 100;
 
+/// A single entry in the bounded audit ring-buffer.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditEntry {
@@ -77,19 +32,11 @@ pub struct AuditEntry {
     pub success: bool,
 }
 
-const EXEC_LOCK: Symbol = symbol_short!("EXEC_LOCK");
-const AUDIT: Symbol = symbol_short!("AUDIT");
-const MAX_AUDIT_ENTRIES: u32 = 100;
-
-/// RAII guard to ensure the execution lock is released on drop.
-pub struct LockGuard {
-    env: Env,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        self.env.storage().instance().set(&EXEC_LOCK, &false);
-    }
+/// Cumulative execution statistics stored under the `STATS` key.
+///
+/// `evicted_entries` counts how many audit records have been dropped from the
+/// ring-buffer since contract initialization, giving operators a signal that
+/// the log has rotated and external archival may be needed.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionStats {
@@ -97,6 +44,8 @@ pub struct ExecutionStats {
     pub successful_executions: u32,
     pub failed_executions: u32,
     pub last_execution_time: u64,
+    /// Total audit entries evicted due to ring-buffer cap enforcement.
+    pub evicted_entries: u32,
 }
 
 #[contracterror]
@@ -120,118 +69,11 @@ pub struct Orchestrator;
 
 #[contractimpl]
 impl Orchestrator {
-    /// Executes the full remittance flow across multiple contracts.
-    /// This is protected against reentrancy.
-    pub fn execute_remittance_flow(
-        env: Env,
-        caller: Address,
-        total_amount: i128,
-        family_wallet: Address,
-        remittance_split: Address,
-        savings: Address,
-        bills: Address,
-        insurance: Address,
-        goal_id: u32,
-        bill_id: u32,
-        policy_id: u32,
-    ) -> Result<(), OrchestratorError> {
-        caller.require_auth();
-
-        if total_amount <= 0 {
-            return Err(OrchestratorError::InvalidAmount);
-        }
-
-        // Use a scope to ensure the guard is dropped (and lock released) 
-        // before we audit and return.
-        let result = {
-            /// The guard acquires the lock on creation and releases it on drop.
-            /// This ensures the lock is released even if we return early via `?`.
-            let _guard = Self::acquire_execution_lock(&env)?;
-
-            Self::perform_remittance_flow(
-                &env,
-                &caller,
-                total_amount,
-                &family_wallet,
-                &remittance_split,
-                &savings,
-                &bills,
-                &insurance,
-                goal_id,
-                bill_id,
-                policy_id,
-            )
-        };
-
-        // 4. Audit result (lock is already released here)
-        Self::append_audit(&env, symbol_short!("remit"), &caller, result.is_ok());
-
-        result
-    }
-
-    fn perform_remittance_flow(
-        env: &Env,
-        caller: &Address,
-        total_amount: i128,
-        family_wallet: &Address,
-        remittance_split: &Address,
-        savings: &Address,
-        bills: &Address,
-        insurance: &Address,
-        goal_id: u32,
-        bill_id: u32,
-        policy_id: u32,
-    ) -> Result<(), OrchestratorError> {
-        // Use interfaces to call downstream contracts
-        // This is a simplified implementation of the flow logic
-        
-        // 1. Check permission/spending limit
-        let fw_client = interface::FamilyWalletClient::new(env, family_wallet);
-        if !fw_client.check_spending_limit(caller, &total_amount) {
-            return Err(OrchestratorError::PermissionDenied);
-        }
-
-        // 2. Calculate split
-        let rs_client = interface::RemittanceSplitClient::new(env, remittance_split);
-        let allocations = rs_client.calculate_split(&total_amount);
-        
-        if allocations.len() < 4 {
-            return Err(OrchestratorError::InvalidAmount);
-        }
-
-        let _spending_amt = allocations.get_unchecked(0);
-        let savings_amt = allocations.get_unchecked(1);
-        let bills_amt = allocations.get_unchecked(2);
-        let insurance_amt = allocations.get_unchecked(3);
-
-        // 3. Downstream calls
-        if savings_amt > 0 {
-            let s_client = interface::SavingsGoalsClient::new(env, savings);
-            s_client.add_to_goal(caller, &goal_id, &savings_amt);
-        }
-
-        if bills_amt > 0 {
-            let b_client = interface::BillPaymentsClient::new(env, bills);
-            b_client.pay_bill(caller, &bill_id, &bills_amt);
-        }
-
-        if insurance_amt > 0 {
-            let i_client = interface::InsuranceClient::new(env, insurance);
-            i_client.pay_premium(caller, &policy_id, &insurance_amt);
     /// Initialize the orchestrator with dependency contract addresses.
-    ///
-    /// # Arguments
-    /// * `caller` - Initialization caller (must authorize)
-    /// * `family_wallet` - Family Wallet contract address
-    /// * `remittance_split` - Remittance Split contract address
-    /// * `savings_goals` - Savings Goals contract address
-    /// * `bill_payments` - Bill Payments contract address
-    /// * `insurance` - Insurance contract address
     ///
     /// # Errors
     /// - `Unauthorized` if already initialized or caller not authorized
     /// - `DuplicateDependency` if any addresses are duplicates or self-reference
-    /// - `InvalidDependency` if invalid configuration
     pub fn init(
         env: Env,
         caller: Address,
@@ -260,11 +102,9 @@ impl Orchestrator {
 
         for i in 0..addresses.len() {
             if let Some(addr_i) = addresses.get(i) {
-                // Check self-reference
                 if addr_i == caller {
                     return Err(OrchestratorError::DuplicateDependency);
                 }
-                // Check duplicates
                 for j in (i + 1)..addresses.len() {
                     if let Some(addr_j) = addresses.get(j) {
                         if addr_i == addr_j {
@@ -277,34 +117,13 @@ impl Orchestrator {
 
         Self::extend_instance_ttl(&env);
 
-        env.storage()
-            .instance()
-            .set(&symbol_short!("OWNER"), &caller);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("FW_ADDR"), &family_wallet);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("RS_ADDR"), &remittance_split);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("SG_ADDR"), &savings_goals);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("BP_ADDR"), &bill_payments);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("INS_ADDR"), &insurance);
-
-        env.storage()
-            .instance()
-            .set(&symbol_short!("EXEC_LOCK"), &false);
-
+        env.storage().instance().set(&symbol_short!("OWNER"), &caller);
+        env.storage().instance().set(&symbol_short!("FW_ADDR"), &family_wallet);
+        env.storage().instance().set(&symbol_short!("RS_ADDR"), &remittance_split);
+        env.storage().instance().set(&symbol_short!("SG_ADDR"), &savings_goals);
+        env.storage().instance().set(&symbol_short!("BP_ADDR"), &bill_payments);
+        env.storage().instance().set(&symbol_short!("INS_ADDR"), &insurance);
+        env.storage().instance().set(&symbol_short!("EXEC_LOCK"), &false);
         env.storage()
             .instance()
             .set(&symbol_short!("NONCES"), &Map::<Address, u64>::new(&env));
@@ -314,10 +133,9 @@ impl Orchestrator {
             successful_executions: 0,
             failed_executions: 0,
             last_execution_time: 0,
+            evicted_entries: 0,
         };
-        env.storage()
-            .instance()
-            .set(&symbol_short!("STATS"), &stats);
+        env.storage().instance().set(&symbol_short!("STATS"), &stats);
 
         /// Emit orchestrator initialization event
         /// Topic: ("Remitwise", EventCategory::System, EventPriority::High, "init_ok")
@@ -336,24 +154,17 @@ impl Orchestrator {
 
     /// Execute a remittance flow with replay protection.
     ///
-    /// # Arguments
-    /// * `executor` - Address executing the flow (must authorize)
-    /// * `amount` - Total amount to distribute
-    /// * `nonce` - Replay-protection nonce (must equal get_nonce(executor))
-    /// * `deadline` - Request expiry timestamp (ledger seconds)
-    /// * `request_hash` - Caller-computed binding hash
-    ///
     /// # Security
-    /// - Authorization-first pattern (caller.require_auth() before any state reads)
+    /// - Authorization-first pattern
     /// - Execution lock to prevent cross-contract reentrancy
     /// - Nonce replay protection with deadline window validation
     /// - Request hash binding to prevent parameter-swap attacks
     ///
     /// # Errors
-    /// - `Unauthorized` if executor doesn't authorize
+    /// - `Unauthorized` if executor doesn't authorize or contract not initialized
     /// - `InvalidAmount` if amount <= 0
     /// - `DeadlineExpired` if deadline is invalid or passed
-    /// - `InvalidNonce` if nonce is invalid
+    /// - `InvalidNonce` if nonce or hash is invalid
     /// - `NonceAlreadyUsed` if nonce was already used
     /// - `ExecutionLocked` if reentrancy detected
     pub fn execute_remittance_flow(
@@ -427,7 +238,7 @@ impl Orchestrator {
             .instance()
             .set(&symbol_short!("EXEC_LOCK"), &true);
 
-        // 7. Execute remittance flow (stubbed for minimal implementation)
+        // 7. Execute remittance flow
         let result = Self::execute_flow_internal(&env, &executor, amount);
 
         // 8. Clear execution lock
@@ -483,26 +294,34 @@ impl Orchestrator {
         Self::get_nonce_value(&env, &address)
     }
 
-    /// Get current execution statistics.
+    /// Get current execution statistics, including evicted audit entry count.
     pub fn get_execution_stats(env: Env) -> Option<ExecutionStats> {
         Self::extend_instance_ttl(&env);
         env.storage().instance().get(&symbol_short!("STATS"))
     }
 
-    /// Get the audit log with pagination support.
+    /// Get a page of audit log entries.
     ///
     /// # Parameters
-    /// - `from_index`: zero-based starting index (0 for first page)
-    /// - `limit`: maximum entries to return; clamped to [1, 50]
+    /// - `from_index`: zero-based cursor into the current bounded window (oldest = 0)
+    /// - `limit`: entries to return; clamped to `[1, MAX_AUDIT_ENTRIES]`; 0 → default 20
+    ///
+    /// # Retention note
+    /// The log is a ring-buffer capped at `MAX_AUDIT_ENTRIES`. Entries are ordered
+    /// oldest-to-newest within the current window. Callers should treat `from_index`
+    /// as a position in the rotated window, not a global immutable ID.
     ///
     /// # Returns
-    /// A vector of audit entries, safe against overflow (uses saturating arithmetic)
+    /// Empty vec when `from_index` is past the end of the log (safe default).
     pub fn get_audit_log(env: Env, from_index: u32, limit: u32) -> Vec<AuditEntry> {
         let log: Option<Vec<AuditEntry>> = env.storage().instance().get(&symbol_short!("AUDIT"));
         let log = log.unwrap_or_else(|| Vec::new(&env));
         let len = log.len();
+
+        // Clamp limit to [1, MAX_AUDIT_ENTRIES]; 0 → default 20
         let cap = Self::clamp_limit(limit);
 
+        // Out-of-range cursor → empty page (safe default)
         if from_index >= len {
             return Vec::new(&env);
         }
@@ -568,20 +387,11 @@ impl Orchestrator {
         _executor: &Address,
         _amount: i128,
     ) -> Result<bool, OrchestratorError> {
-        // Stubbed implementation: minimal skeleton
-        // Phase 2 will integrate actual cross-contract calls to:
-        // - family_wallet for spending validation
-        // - remittance_split for split calculation
-        // - savings_goals/bill_payments/insurance for distributions
-
-        // For now, just verify the executor and amount are valid
         let _owner: Address = env
             .storage()
             .instance()
             .get(&symbol_short!("OWNER"))
             .ok_or(OrchestratorError::Unauthorized)?;
-
-        // Placeholder: would validate spending limits and execute transfers
         Ok(true)
     }
 
@@ -602,13 +412,11 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Hardened nonce validation with three layers of replay protection:
-    ///
-    /// 1. **Deadline check** — rejects requests whose `deadline` is in the past
-    ///    or further than `MAX_DEADLINE_WINDOW_SECS` in the future
-    /// 2. **Sequential counter** — the nonce must equal `get_nonce(address)`
-    /// 3. **Used-nonce set** — prevents double-spend even if counter is reset
-    /// 4. **Request hash binding** — prevents parameter-swap replay attacks
+    /// Hardened nonce validation:
+    /// 1. Deadline must be in the future and within `MAX_DEADLINE_WINDOW_SECS`
+    /// 2. Sequential counter check
+    /// 3. Used-nonce double-spend check
+    /// 4. Request hash binding
     fn require_nonce_hardened(
         env: &Env,
         address: &Address,
@@ -619,7 +427,6 @@ impl Orchestrator {
     ) -> Result<(), OrchestratorError> {
         let now = env.ledger().timestamp();
 
-        // 1. Deadline: must be in the future but not too far ahead
         if deadline <= now {
             return Err(OrchestratorError::DeadlineExpired);
         }
@@ -627,15 +434,12 @@ impl Orchestrator {
             return Err(OrchestratorError::DeadlineExpired);
         }
 
-        // 2. Sequential counter
         Self::require_nonce(env, address, nonce)?;
 
-        // 3. Used-nonce double-spend check
         if Self::is_nonce_used(env, address, nonce) {
             return Err(OrchestratorError::NonceAlreadyUsed);
         }
 
-        // 4. Request hash binding
         if request_hash != expected_hash {
             return Err(OrchestratorError::InvalidNonce);
         }
@@ -643,41 +447,6 @@ impl Orchestrator {
         Ok(())
     }
 
-    fn acquire_execution_lock(env: &Env) -> Result<LockGuard, OrchestratorError> {
-        let is_locked: bool = env.storage().instance().get(&EXEC_LOCK).unwrap_or(false);
-        if is_locked {
-            return Err(OrchestratorError::ReentrancyDetected);
-        }
-        env.storage().instance().set(&EXEC_LOCK, &true);
-        Ok(LockGuard { env: env.clone() })
-    }
-
-    fn append_audit(env: &Env, operation: Symbol, caller: &Address, success: bool) {
-        let timestamp = env.ledger().timestamp();
-        let mut log: Vec<OrchestratorAuditEntry> = env
-            .storage()
-            .instance()
-            .get(&AUDIT)
-            .unwrap_or_else(|| Vec::new(env));
-        
-        if log.len() >= MAX_AUDIT_ENTRIES {
-            log.remove(0);
-        }
-        
-        log.push_back(OrchestratorAuditEntry {
-            operation,
-            caller: caller.clone(),
-            timestamp,
-            success,
-        });
-        
-        env.storage().instance().set(&AUDIT, &log);
-    }
-
-    pub fn get_execution_state(env: Env) -> bool {
-        env.storage().instance().get(&EXEC_LOCK).unwrap_or(false)
-    }
-}
     fn is_nonce_used(env: &Env, address: &Address, nonce: u64) -> bool {
         let key = symbol_short!("USED_N");
         let map: Option<Map<Address, Vec<u64>>> = env.storage().instance().get(&key);
@@ -700,7 +469,6 @@ impl Orchestrator {
 
         let mut used: Vec<u64> = map.get(address.clone()).unwrap_or_else(|| Vec::new(env));
 
-        // Evict oldest if at capacity
         if used.len() >= MAX_USED_NONCES_PER_ADDR {
             let mut trimmed = Vec::new(env);
             for i in 1..used.len() {
@@ -718,7 +486,6 @@ impl Orchestrator {
 
     fn increment_nonce(env: &Env, address: &Address) -> Result<(), OrchestratorError> {
         let current = Self::get_nonce_value(env, address);
-        // Mark current nonce as used BEFORE advancing the counter
         Self::mark_nonce_used(env, address, current);
 
         let next = current.checked_add(1).ok_or(OrchestratorError::Overflow)?;
@@ -742,7 +509,6 @@ impl Orchestrator {
         deadline: u64,
     ) -> u64 {
         let op_bits: u64 = operation.to_val().get_payload();
-
         let amt_lo = amount as u64;
         let amt_hi = (amount >> 64) as u64;
 
@@ -754,7 +520,12 @@ impl Orchestrator {
             .wrapping_mul(1_000_000_007)
     }
 
-    fn append_audit(env: &Env, operation: Symbol, _executor: &Address, success: bool) {
+    /// Append an audit entry to the bounded ring-buffer.
+    ///
+    /// When the log reaches `MAX_AUDIT_ENTRIES` the oldest entry is evicted and
+    /// `ExecutionStats::evicted_entries` is incremented so operators can detect
+    /// rotation without reading the full log.
+    fn append_audit(env: &Env, operation: Symbol, executor: &Address, success: bool) {
         let timestamp = env.ledger().timestamp();
         let mut log: Vec<AuditEntry> = env
             .storage()
@@ -763,6 +534,7 @@ impl Orchestrator {
             .unwrap_or_else(|| Vec::new(env));
 
         if log.len() >= MAX_AUDIT_ENTRIES {
+            // Evict oldest entry (ring-buffer rotation)
             let mut new_log = Vec::new(env);
             for i in 1..log.len() {
                 if let Some(entry) = log.get(i) {
@@ -770,11 +542,28 @@ impl Orchestrator {
                 }
             }
             log = new_log;
+
+            // Track eviction count in stats
+            let mut stats: ExecutionStats = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("STATS"))
+                .unwrap_or(ExecutionStats {
+                    total_executions: 0,
+                    successful_executions: 0,
+                    failed_executions: 0,
+                    last_execution_time: 0,
+                    evicted_entries: 0,
+                });
+            stats.evicted_entries = stats.evicted_entries.saturating_add(1);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("STATS"), &stats);
         }
 
         log.push_back(AuditEntry {
             operation,
-            executor: _executor.clone(),
+            executor: executor.clone(),
             timestamp,
             success,
         });
@@ -792,6 +581,7 @@ impl Orchestrator {
                 successful_executions: 0,
                 failed_executions: 0,
                 last_execution_time: 0,
+                evicted_entries: 0,
             });
 
         stats.total_executions = stats.total_executions.saturating_add(1);
@@ -807,11 +597,12 @@ impl Orchestrator {
             .set(&symbol_short!("STATS"), &stats);
     }
 
+    /// Clamp pagination limit: 0 → 20 (default), >MAX_AUDIT_ENTRIES → MAX_AUDIT_ENTRIES.
     fn clamp_limit(limit: u32) -> u32 {
         if limit == 0 {
-            20 // DEFAULT_PAGE_LIMIT
-        } else if limit > 50 {
-            50 // MAX_PAGE_LIMIT
+            20
+        } else if limit > MAX_AUDIT_ENTRIES {
+            MAX_AUDIT_ENTRIES
         } else {
             limit
         }

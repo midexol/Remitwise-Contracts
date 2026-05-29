@@ -972,6 +972,7 @@ impl Insurance {
     }
 }
 
+#[cfg(test)]
 mod test;
 
 #[cfg(test)]
