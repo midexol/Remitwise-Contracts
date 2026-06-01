@@ -1192,3 +1192,207 @@ fn test_execute_mixed_due_not_due() {
         assert!(schedule2.active);
     }
 }
+
+// ============================================================
+// Deadline Boundary Tests for distribute_usdc_signed
+// ============================================================
+// These tests cover the exact comparison semantics for deadline
+// validation in the signed distribution path.
+//
+// Deadline window semantics:
+// - deadline == 0                          -> InvalidDeadline
+// - deadline < now                         -> DeadlineExpired
+// - deadline == now                        -> DeadlineExpired (strictly greater required)
+// - deadline == now + 1                    -> Accepted
+// - deadline > now + MAX_DEADLINE_WINDOW_SECS -> InvalidDeadline
+// - deadline == now + MAX_DEADLINE_WINDOW_SECS -> Accepted
+//
+// Security: expired/invalid deadlines must NOT advance the nonce.
+
+fn setup_signed_distribution(env: &Env) -> (
+    RemittanceSplitClient<'_>,
+    Address,
+    Address,
+    soroban_sdk::token::StellarAssetClient<'_>,
+) {
+    env.mock_all_auths();
+    env.ledger().set_timestamp(10_000);
+
+    let contract_id = env.register_contract(None, RemittanceSplit);
+    let client = RemittanceSplitClient::new(env, &contract_id);
+
+    let owner = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+    let token_addr = token_contract.address();
+    let stellar_client = soroban_sdk::token::StellarAssetClient::new(env, &token_addr);
+
+    client.initialize_split(&owner, &0, &token_addr, &40, &30, &20, &10);
+    stellar_client.mint(&owner, &10_000i128);
+
+    (client, owner, token_addr, stellar_client)
+}
+
+fn make_request(
+    env: &Env,
+    usdc_contract: Address,
+    from: Address,
+    nonce: u64,
+    deadline: u64,
+) -> DistributeUsdcRequest {
+    DistributeUsdcRequest {
+        usdc_contract,
+        from: from.clone(),
+        nonce,
+        accounts: AccountGroup {
+            spending: Address::generate(env),
+            savings: Address::generate(env),
+            bills: Address::generate(env),
+            insurance: Address::generate(env),
+        },
+        total_amount: 1000i128,
+        deadline,
+    }
+}
+
+/// deadline == 0 must return InvalidDeadline
+#[test]
+fn test_deadline_zero_is_invalid() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let request = make_request(&env, token_addr.clone(), owner.clone(), 1, 0);
+    let result = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+    assert_eq!(
+        result,
+        Err(Ok(RemittanceSplitError::InvalidDeadline))
+    );
+}
+
+/// deadline == now must be rejected (DeadlineExpired)
+#[test]
+fn test_deadline_equal_to_now_is_expired() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let request = make_request(&env, token_addr.clone(), owner.clone(), 1, now);
+    let result = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+    assert_eq!(
+        result,
+        Err(Ok(RemittanceSplitError::DeadlineExpired))
+    );
+}
+
+/// deadline == now - 1 must be rejected (DeadlineExpired)
+#[test]
+fn test_deadline_one_second_past_is_expired() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let request = make_request(&env, token_addr.clone(), owner.clone(), 1, now - 1);
+    let result = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+    assert_eq!(
+        result,
+        Err(Ok(RemittanceSplitError::DeadlineExpired))
+    );
+}
+
+/// deadline == now + 1 must be accepted (valid boundary)
+#[test]
+fn test_deadline_one_second_future_is_accepted() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let request = make_request(&env, token_addr.clone(), owner.clone(), 1, now + 1);
+    // Should not return DeadlineExpired or InvalidDeadline
+    let result = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+    assert!(
+        result != Err(Ok(RemittanceSplitError::DeadlineExpired))
+            && result != Err(Ok(RemittanceSplitError::InvalidDeadline)),
+        "deadline now+1 should pass deadline validation"
+    );
+}
+
+/// deadline == now + MAX_DEADLINE_WINDOW_SECS must be accepted (upper boundary)
+#[test]
+fn test_deadline_at_max_window_is_accepted() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let request = make_request(
+        &env,
+        token_addr.clone(),
+        owner.clone(),
+        1,
+        now + MAX_DEADLINE_WINDOW_SECS,
+    );
+    let result = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+    assert!(
+        result != Err(Ok(RemittanceSplitError::DeadlineExpired))
+            && result != Err(Ok(RemittanceSplitError::InvalidDeadline)),
+        "deadline at max window should pass deadline validation"
+    );
+}
+
+/// deadline == now + MAX_DEADLINE_WINDOW_SECS + 1 must return InvalidDeadline
+#[test]
+fn test_deadline_beyond_max_window_is_invalid() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let request = make_request(
+        &env,
+        token_addr.clone(),
+        owner.clone(),
+        1,
+        now + MAX_DEADLINE_WINDOW_SECS + 1,
+    );
+    let result = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+    assert_eq!(
+        result,
+        Err(Ok(RemittanceSplitError::InvalidDeadline))
+    );
+}
+
+/// Expired deadline must NOT advance the nonce (replay-window safety)
+#[test]
+fn test_expired_deadline_does_not_advance_nonce() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+    let now = env.ledger().timestamp();
+
+    let nonce_before = client.get_nonce(&owner);
+
+    let request = make_request(&env, token_addr.clone(), owner.clone(), 1, now - 1);
+    let _ = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+
+    let nonce_after = client.get_nonce(&owner);
+    assert_eq!(
+        nonce_before, nonce_after,
+        "nonce must not advance on expired deadline"
+    );
+}
+
+/// Invalid deadline (zero) must NOT advance the nonce
+#[test]
+fn test_invalid_deadline_does_not_advance_nonce() {
+    let env = Env::default();
+    let (client, owner, token_addr, _) = setup_signed_distribution(&env);
+
+    let nonce_before = client.get_nonce(&owner);
+
+    let request = make_request(&env, token_addr.clone(), owner.clone(), 1, 0);
+    let _ = client.try_distribute_usdc_hashed(&request, &RemittanceSplit::get_request_hash(env.clone(), request.clone()));
+
+    let nonce_after = client.get_nonce(&owner);
+    assert_eq!(
+        nonce_before, nonce_after,
+        "nonce must not advance on invalid deadline"
+    );
+}
