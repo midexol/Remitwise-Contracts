@@ -312,20 +312,17 @@ impl SavingsGoalContract {
         if name_len == 0 || name_len > 32 {
             return Err(SavingsGoalError::InvalidGoalName);
         }
-
-        let mut string_bytes = alloc::vec::Vec::new();
-        name.to_string()
-            .as_bytes()
-            .iter()
-            .for_each(|&b| string_bytes.push(b));
-        for byte in string_bytes {
+        let mut buf = [0u8; 32];
+        name.copy_into_slice(&mut buf[..name_len as usize]);
+        for byte in &buf[..name_len as usize] {
             // Allow printable ASCII characters (32 to 126 inclusive)
-            if byte < 32 || byte > 126 {
+            if *byte < 32 || *byte > 126 {
                 return Err(SavingsGoalError::InvalidGoalName);
             }
         }
         Ok(())
     }
+
 
     fn get_pause_admin(env: &Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PauseAdmin)
