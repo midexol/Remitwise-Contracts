@@ -141,6 +141,7 @@ pub enum DataKey {
     ArchivedGoal(u32),           // Persistent: ArchivedSavingsGoal
     OwnerGoals(Address),         // Persistent: Vec<u32>
     ArchivedGoalsIndex(Address), // Persistent: Vec<u32>
+    TagIndex(Address, String),   // Persistent: Vec<u32> (goal ids by owner & canonicalized tag)
     PauseAdmin,                  // Instance: Address
     Paused,                      // Instance: bool
     PausedFunctions,             // Instance: Map<Symbol, bool>
@@ -609,7 +610,64 @@ impl SavingsGoalContract {
         })
     }
 
-    /// Adds tags to a goal's metadata.
+    /// Adds a goal ID to the tag index for an (owner, tag) pair.
+    /// Maintains canonicalized tag index; no duplicate goal IDs per tag.
+    fn add_to_tag_index(env: &Env, owner: &Address, tag: &String, goal_id: u32) {
+        let key = DataKey::TagIndex(owner.clone(), tag.clone());
+        let mut ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        
+        // Avoid duplicate goal IDs in the index
+        let mut exists = false;
+        for id in ids.iter() {
+            if id == goal_id {
+                exists = true;
+                break;
+            }
+        }
+        if !exists {
+            ids.push_back(goal_id);
+        }
+        
+        env.storage().persistent().set(&key, &ids);
+        env.storage().persistent().extend_ttl(
+            &key,
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+    }
+
+    /// Removes a goal ID from the tag index for an (owner, tag) pair.
+    fn remove_from_tag_index(env: &Env, owner: &Address, tag: &String, goal_id: u32) {
+        let key = DataKey::TagIndex(owner.clone(), tag.clone());
+        let ids: Vec<u32> = match env.storage().persistent().get(&key) {
+            Some(ids) => ids,
+            None => return,
+        };
+
+        let mut out = Vec::new(env);
+        for id in ids.iter() {
+            if id != goal_id {
+                out.push_back(id);
+            }
+        }
+
+        if out.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &out);
+            env.storage().persistent().extend_ttl(
+                &key,
+                INSTANCE_LIFETIME_THRESHOLD,
+                INSTANCE_BUMP_AMOUNT,
+            );
+        }
+    }
+
+    /// Adds tags to a goal's metadata and updates the tag index.
     ///
     /// Security:
     /// - `caller` must authorize the invocation.
@@ -617,6 +675,7 @@ impl SavingsGoalContract {
     ///
     /// Notes:
     /// - Duplicate tags are preserved as provided.
+    /// - Maintains canonicalized tag index; each (owner, tag) maps to goal IDs.
     /// - Emits `(savings, tags_add)` with `(goal_id, caller, tags)`.
     pub fn add_tags_to_goal(env: Env, caller: Address, goal_id: u32, tags: Vec<String>) {
         caller.require_auth();
@@ -641,7 +700,9 @@ impl SavingsGoalContract {
         }
 
         for tag in normalized_tags.iter() {
-            goal.tags.push_back(tag);
+            goal.tags.push_back(tag.clone());
+            // Maintain tag index for this (owner, tag) pair
+            Self::add_to_tag_index(&env, &caller, &tag, goal_id);
         }
 
         env.storage()
@@ -668,7 +729,7 @@ impl SavingsGoalContract {
         Self::append_audit(&env, symbol_short!("add_tags"), &caller, true);
     }
 
-    /// Removes tags from a goal's metadata.
+    /// Removes tags from a goal's metadata and updates the tag index.
     ///
     /// Security:
     /// - `caller` must authorize the invocation.
@@ -676,6 +737,7 @@ impl SavingsGoalContract {
     ///
     /// Notes:
     /// - Removing a tag that is not present is a no-op.
+    /// - Removes goal ID from tag index for each removed tag.
     /// - Emits `(savings, tags_rem)` with `(goal_id, caller, tags)`.
     pub fn remove_tags_from_goal(env: Env, caller: Address, goal_id: u32, tags: Vec<String>) {
         caller.require_auth();
@@ -705,6 +767,8 @@ impl SavingsGoalContract {
             for remove_tag in normalized_tags.iter() {
                 if existing_tag == remove_tag {
                     should_keep = false;
+                    // Remove goal ID from the tag index for this tag
+                    Self::remove_from_tag_index(&env, &caller, &existing_tag, goal_id);
                     break;
                 }
             }
@@ -1445,6 +1509,85 @@ impl SavingsGoalContract {
         }
     }
 
+    /// Returns a deterministic page of active goals matching a given tag for an owner.
+    ///
+    /// # Arguments
+    /// * `owner`  - whose goals to filter by tag
+    /// * `tag`    - canonicalized tag to query (will be normalized)
+    /// * `cursor` - start after this goal ID (pass 0 for the first page)
+    /// * `limit`  - max items per page (0 -> DEFAULT_PAGE_LIMIT, capped at MAX_PAGE_LIMIT)
+    ///
+    /// # Returns
+    /// `GoalPage { items, next_cursor, count }`.
+    /// `next_cursor == 0` means no more pages.
+    ///
+    /// # Notes
+    /// - Uses the tag index for O(matching goals) performance instead of scanning all goals.
+    /// - Tag is canonicalized (lowercased) to match storage keys.
+    pub fn get_goals_by_tag(env: Env, owner: Address, tag: String, cursor: u32, limit: u32) -> GoalPage {
+        let limit = Self::clamp_limit(limit);
+
+        // Canonicalize the tag for lookup
+        let mut tags_vec = Vec::new(&env);
+        tags_vec.push_back(tag.clone());
+        let normalized = Self::validate_and_normalize_tags(&env, &tags_vec);
+        let canonical_tag = normalized.get(0).unwrap_or_else(|| panic!("Tag normalization failed"));
+
+        let ids: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TagIndex(owner.clone(), canonical_tag.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if ids.is_empty() {
+            return GoalPage {
+                items: Vec::new(&env),
+                next_cursor: 0,
+                count: 0,
+            };
+        }
+
+        let mut start_index: u32 = 0;
+        if cursor != 0 {
+            if let Some(pos) = ids.iter().position(|id| id == cursor) {
+                start_index = (pos as u32) + 1;
+            } else {
+                panic!("Invalid cursor");
+            }
+        }
+
+        let mut end_index = start_index + limit;
+        if end_index > ids.len() {
+            end_index = ids.len();
+        }
+
+        let mut result = Vec::new(&env);
+        for goal_id in ids.iter().skip(start_index as usize).take(limit as usize) {
+            let goal = env
+                .storage()
+                .persistent()
+                .get::<_, SavingsGoal>(&DataKey::Goal(goal_id))
+                .unwrap_or_else(|| panic!("Tag index out of sync"));
+            if goal.owner != owner {
+                panic!("Tag index owner mismatch");
+            }
+            result.push_back(goal);
+        }
+
+        let next_cursor = if end_index < ids.len() {
+            ids.get(end_index - 1)
+                .unwrap_or_else(|| panic!("Tag index out of sync"))
+        } else {
+            0
+        };
+
+        GoalPage {
+            items: result,
+            next_cursor,
+            count: end_index - start_index,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ARCHIVED GOALS (INDEXED + PAGINATED)
     // -----------------------------------------------------------------------
@@ -1459,6 +1602,7 @@ impl SavingsGoalContract {
     /// Notes:
     /// - Removes the goal from the active owner index and inserts it into the archived owner index.
     /// - Archived pagination order is deterministic: ascending goal ID for that owner.
+    /// - Removes goal ID from all tag indexes it was associated with.
     pub fn archive_goal(env: Env, caller: Address, goal_id: u32) -> bool {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::ARCHIVE);
@@ -1492,6 +1636,11 @@ impl SavingsGoalContract {
         {
             Self::append_audit(&env, symbol_short!("archive"), &caller, false);
             panic!("Goal already archived");
+        }
+
+        // Remove goal from all tag indexes before archiving
+        for tag in goal.tags.iter() {
+            Self::remove_from_tag_index(&env, &caller, &tag, goal_id);
         }
 
         env.storage().persistent().remove(&DataKey::Goal(goal_id));
@@ -1547,9 +1696,16 @@ impl SavingsGoalContract {
         env.storage()
             .persistent()
             .remove(&DataKey::ArchivedGoal(goal_id));
+        let restored_goal = archived_goal.into_goal();
+        
+        // Re-index goal in all tag indexes
+        for tag in restored_goal.tags.iter() {
+            Self::add_to_tag_index(&env, &caller, &tag, goal_id);
+        }
+        
         env.storage()
             .persistent()
-            .set(&DataKey::Goal(goal_id), &archived_goal.into_goal());
+            .set(&DataKey::Goal(goal_id), &restored_goal);
         env.storage().persistent().extend_ttl(
             &DataKey::Goal(goal_id),
             INSTANCE_LIFETIME_THRESHOLD,

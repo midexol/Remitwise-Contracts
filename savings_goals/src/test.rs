@@ -5234,3 +5234,284 @@ fn test_import_snapshot_ordering_version_validation_comes_first() {
         "valid version with bad checksum must return ChecksumMismatch (version validated first)"
     );
 }
+
+
+// ============================================================================
+// Tag Index Tests
+// ============================================================================
+
+#[test]
+fn test_get_goals_by_tag_empty() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let tag = String::from_str(&env, "travel");
+    let page = client.get_goals_by_tag(&user, &tag, &0, &50);
+
+    assert_eq!(page.count, 0);
+    assert_eq!(page.next_cursor, 0);
+}
+
+#[test]
+fn test_add_tags_maintains_index() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Travel Fund");
+    let goal_id = client.create_goal(&user, &name, &5000, &1735689600);
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Travel"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Query by tag should now find the goal
+    let tag = String::from_str(&env, "travel");
+    let page = client.get_goals_by_tag(&user, &tag, &0, &50);
+
+    assert_eq!(page.count, 1);
+    assert_eq!(page.items.get(0).unwrap_or_else(|| panic!("Goal not found")).id, goal_id);
+}
+
+#[test]
+fn test_remove_tags_updates_index() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Emergency Fund");
+    let goal_id = client.create_goal(&user, &name, &10000, &1735689600);
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Emergency"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Verify goal is indexed
+    let page = client.get_goals_by_tag(&user, &String::from_str(&env, "emergency"), &0, &50);
+    assert_eq!(page.count, 1);
+
+    // Remove tag
+    client.remove_tags_from_goal(&user, &goal_id, &tags);
+
+    // Verify goal no longer in index
+    let page_after = client.get_goals_by_tag(&user, &String::from_str(&env, "emergency"), &0, &50);
+    assert_eq!(page_after.count, 0);
+}
+
+#[test]
+fn test_archive_goal_removes_from_tag_index() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Completed Goal");
+    let goal_id = client.create_goal(&user, &name, &1000, &1735689600);
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Completed"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Add funds to complete goal
+    client.add_to_goal(&user, &goal_id, &1000);
+
+    // Archive the goal
+    client.archive_goal(&user, &goal_id);
+
+    // Goal should no longer appear in tag index
+    let page = client.get_goals_by_tag(&user, &String::from_str(&env, "completed"), &0, &50);
+    assert_eq!(page.count, 0);
+}
+
+#[test]
+fn test_restore_goal_readds_to_tag_index() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Restore Test");
+    let goal_id = client.create_goal(&user, &name, &1000, &1735689600);
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Restore"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Complete and archive
+    client.add_to_goal(&user, &goal_id, &1000);
+    client.archive_goal(&user, &goal_id);
+
+    // Verify not in tag index
+    let before = client.get_goals_by_tag(&user, &String::from_str(&env, "restore"), &0, &50);
+    assert_eq!(before.count, 0);
+
+    // Restore the goal
+    client.restore_goal(&user, &goal_id);
+
+    // Goal should be back in tag index
+    let after = client.get_goals_by_tag(&user, &String::from_str(&env, "restore"), &0, &50);
+    assert_eq!(after.count, 1);
+}
+
+#[test]
+fn test_get_goals_by_tag_pagination() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let tag_str = String::from_str(&env, "Savings");
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(tag_str.clone());
+
+    // Create 5 goals with same tag
+    let mut goal_ids = SorobanVec::new(&env);
+    for i in 0..5u32 {
+        let name = String::from_str(&env, &format!("Goal {}", i));
+        let goal_id = client.create_goal(&user, &name, &(i as i128 + 1) * 1000, &1735689600);
+        goal_ids.push_back(goal_id);
+        client.add_tags_to_goal(&user, &goal_id, &tags);
+    }
+
+    // Get first page (limit 2)
+    let page1 = client.get_goals_by_tag(&user, &tag_str, &0, &2);
+    assert_eq!(page1.count, 2);
+    assert_ne!(page1.next_cursor, 0);
+
+    // Get second page
+    let page2 = client.get_goals_by_tag(&user, &tag_str, &page1.next_cursor, &2);
+    assert_eq!(page2.count, 2);
+    assert_ne!(page2.next_cursor, 0);
+
+    // Get final page
+    let page3 = client.get_goals_by_tag(&user, &tag_str, &page2.next_cursor, &2);
+    assert_eq!(page3.count, 1);
+    assert_eq!(page3.next_cursor, 0);
+}
+
+#[test]
+fn test_tag_canonicalization_on_query() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Test Goal");
+    let goal_id = client.create_goal(&user, &name, &5000, &1735689600);
+
+    // Add tag with mixed case
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "TravelFund"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Query with different casing - should still find via canonicalization
+    let page_lower = client.get_goals_by_tag(&user, &String::from_str(&env, "travelfund"), &0, &50);
+    assert_eq!(page_lower.count, 1);
+
+    let page_upper = client.get_goals_by_tag(&user, &String::from_str(&env, "TRAVELFUND"), &0, &50);
+    assert_eq!(page_upper.count, 1);
+
+    let page_mixed = client.get_goals_by_tag(&user, &String::from_str(&env, "TravelFund"), &0, &50);
+    assert_eq!(page_mixed.count, 1);
+}
+
+#[test]
+fn test_multiple_tags_per_goal() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Multi-tag Goal");
+    let goal_id = client.create_goal(&user, &name, &10000, &1735689600);
+
+    // Add multiple tags
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Travel"));
+    tags.push_back(String::from_str(&env, "Adventure"));
+    tags.push_back(String::from_str(&env, "Savings"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Goal should appear in all three tag indexes
+    let page_travel = client.get_goals_by_tag(&user, &String::from_str(&env, "travel"), &0, &50);
+    assert_eq!(page_travel.count, 1);
+
+    let page_adventure = client.get_goals_by_tag(&user, &String::from_str(&env, "adventure"), &0, &50);
+    assert_eq!(page_adventure.count, 1);
+
+    let page_savings = client.get_goals_by_tag(&user, &String::from_str(&env, "savings"), &0, &50);
+    assert_eq!(page_savings.count, 1);
+}
+
+#[test]
+fn test_tag_index_no_duplicate_goal_ids() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name = String::from_str(&env, "Duplicate Test");
+    let goal_id = client.create_goal(&user, &name, &5000, &1735689600);
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Emergency"));
+    
+    // Add same tag twice
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    // Query should return exactly 1 result, not duplicates
+    let page = client.get_goals_by_tag(&user, &String::from_str(&env, "emergency"), &0, &50);
+    assert_eq!(page.count, 1);
+}
+
+#[test]
+fn test_different_owners_separate_tag_indexes() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    env.mock_all_auths();
+    client.init();
+
+    let name1 = String::from_str(&env, "User1 Goal");
+    let name2 = String::from_str(&env, "User2 Goal");
+    let goal_id1 = client.create_goal(&user1, &name1, &5000, &1735689600);
+    let goal_id2 = client.create_goal(&user2, &name2, &5000, &1735689600);
+
+    // Both add same tag
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "Savings"));
+    client.add_tags_to_goal(&user1, &goal_id1, &tags);
+    client.add_tags_to_goal(&user2, &goal_id2, &tags);
+
+    // Each user should only see their own goal
+    let page1 = client.get_goals_by_tag(&user1, &String::from_str(&env, "savings"), &0, &50);
+    assert_eq!(page1.count, 1);
+
+    let page2 = client.get_goals_by_tag(&user2, &String::from_str(&env, "savings"), &0, &50);
+    assert_eq!(page2.count, 1);
+}
