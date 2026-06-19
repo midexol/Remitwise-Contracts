@@ -1,7 +1,7 @@
 #![no_std]
 use remitwise_common::{
     CoverageType, DEFAULT_PAGE_LIMIT, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD,
-    MAX_BATCH_SIZE, MAX_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
@@ -210,7 +210,7 @@ impl Insurance {
 
     fn validate_ext_ref(ext_ref: &core::option::Option<String>) -> Result<(), InsuranceError> {
         if let Some(r) = ext_ref {
-            if r.len() == 0 || r.len() > MAX_EXT_REF_LEN {
+            if r.is_empty() || r.len() > MAX_EXT_REF_LEN {
                 return Err(InsuranceError::InvalidExternalRef);
             }
         }
@@ -239,7 +239,7 @@ impl Insurance {
         Self::require_initialized(&env)?;
         caller.require_auth();
 
-        if name.len() == 0 {
+        if name.is_empty() {
             return Err(InsuranceError::InvalidName);
         }
         if name.len() > MAX_NAME_LEN {
@@ -289,7 +289,7 @@ impl Insurance {
             id: next_id,
             owner: caller.clone(),
             name: name.clone(),
-            coverage_type: coverage_type.clone(),
+            coverage_type,
             monthly_premium,
             coverage_amount,
             external_ref: core::option::Option::None,
@@ -463,7 +463,7 @@ impl Insurance {
             .instance()
             .set(&DataKey::Policy(policy_id), &policy);
 
-        let mut active = env
+        let active = env
             .storage()
             .instance()
             .get::<_, Vec<u32>>(&DataKey::ActivePolicies)
@@ -490,16 +490,12 @@ impl Insurance {
     }
 
     /// Get a paginated list of active policies for an owner.
-    ///
-    /// # Errors
-    /// - `NotInitialized` if the contract has not been initialized
     pub fn get_active_policies(
         env: Env,
         owner: Address,
         cursor: u32,
         limit: u32,
     ) -> Result<PolicyPage, InsuranceError> {
-        Self::require_initialized(&env)?;
         let owner_ids = env
             .storage()
             .instance()
@@ -542,23 +538,15 @@ impl Insurance {
     }
 
     /// Get a policy by ID.
-    ///
-    /// # Errors
-    /// - `NotInitialized` if the contract has not been initialized
     pub fn get_policy(
         env: Env,
         policy_id: u32,
     ) -> Result<core::option::Option<Policy>, InsuranceError> {
-        Self::require_initialized(&env)?;
         Ok(env.storage().instance().get(&DataKey::Policy(policy_id)))
     }
 
     /// Get the total monthly premium for all active policies owned by an address.
-    ///
-    /// # Errors
-    /// - `NotInitialized` if the contract has not been initialized
     pub fn get_total_monthly_premium(env: Env, owner: Address) -> Result<i128, InsuranceError> {
-        Self::require_initialized(&env)?;
         let owner_ids = env
             .storage()
             .instance()
@@ -579,3 +567,6 @@ impl Insurance {
         Ok(total)
     }
 }
+
+#[cfg(test)]
+mod test;
