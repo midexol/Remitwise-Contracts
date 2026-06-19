@@ -4962,6 +4962,54 @@ fn test_create_goal_accepts_special_chars_within_limit() {
 // #[test] fn test_batch_operations_enforce_lock — no batch withdrawal in this contract
 
 #[test]
+fn test_batch_add_to_goals_rejects_too_large_batch_size() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.init();
+
+    // Use MAX_BATCH_SIZE goals to build a valid contributions batch.
+    // Contract should accept MAX_BATCH_SIZE.
+    let name = String::from_str(&env, "BatchCapOk");
+
+    let mut contributions = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE {
+        let goal_id = client.create_goal(&owner, &name, &10_000i128, &1_800_000u64);
+        contributions.push_back(ContributionItem {
+            goal_id,
+            amount: 100,
+        });
+    }
+
+    let res_ok = client.batch_add_to_goals(&owner, &contributions);
+    assert!(res_ok.is_ok());
+    assert_eq!(res_ok.unwrap(), MAX_BATCH_SIZE);
+
+    // MAX_BATCH_SIZE + 1 must be rejected.
+    let name = String::from_str(&env, "BatchCapTooLarge");
+    let mut contributions_oversized = Vec::new(&env);
+
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
+        let goal_id = client.create_goal(&owner, &name, &10_000i128, &1_800_000u64);
+        contributions_oversized.push_back(ContributionItem {
+            goal_id,
+            amount: 100,
+        });
+    }
+
+    let res_err = client.try_batch_add_to_goals(&owner, &contributions_oversized);
+    assert!(res_err.is_err());
+    assert_eq!(
+        res_err.unwrap_err().unwrap(),
+        SavingsGoalError::BatchTooLarge
+    );
+}
+
+
+#[test]
 fn test_per_owner_goal_cap() {
     let env = Env::default();
     env.mock_all_auths();
