@@ -1728,3 +1728,287 @@ fn test_get_schedules_paginated_full_scale_cursor_monotonicity() {
     assert_eq!(beyond_end.items.len(), 0);
     assert_eq!(beyond_end.next_cursor, 0);
 }
+
+// ============================================================================
+// get_split_allocations shape invariant tests
+//
+// These tests pin the shape contract documented in
+// docs/remittance-split-allocations-shape.md:
+//
+//   1. Uninitialized contract   → default [50,30,15,5] percentages, no panic,
+//                                 4 allocations, deterministic category order.
+//   2. Single 100% slot         → exactly 4 allocations, correct Category, sum == total.
+//   3. Zero amount              → Err(InvalidAmount); no partial allocation produced.
+//   4. Amount conservation      → sum(allocation.amount) == total_amount for every case.
+//   5. Deterministic ordering   → category symbols are always SPENDING/SAVINGS/BILLS/INSURANCE.
+//   6. Large amount             → i128::MAX/2 with 100/0/0/0 and default config, no overflow.
+//   7. Max categories at 100    → percentages across all 4 slots summing to 100.
+// ============================================================================
+
+/// Helper: assert the four returned category symbols are in canonical order.
+fn assert_canonical_order(env: &Env, allocs: &soroban_sdk::Vec<Allocation>) {
+    assert_eq!(allocs.len(), 4, "must return exactly 4 allocations");
+    assert_eq!(allocs.get(0).unwrap().category, symbol_short!("SPENDING"));
+    assert_eq!(allocs.get(1).unwrap().category, symbol_short!("SAVINGS"));
+    assert_eq!(allocs.get(2).unwrap().category, symbol_short!("BILLS"));
+    assert_eq!(allocs.get(3).unwrap().category, symbol_short!("INSURANCE"));
+}
+
+/// Helper: assert sum of allocation amounts equals `total`.
+fn assert_conservation(allocs: &soroban_sdk::Vec<Allocation>, total: i128) {
+    let sum: i128 = allocs
+        .iter()
+        .map(|a| a.amount)
+        .fold(0i128, |acc, x| acc + x);
+    assert_eq!(sum, total, "allocation amounts must sum to total_amount");
+}
+
+/// Shape invariant: uninitialized contract uses the default [50,30,15,5] split,
+/// returns 4 allocations in canonical order, and satisfies amount conservation.
+/// Verifies that get_split_allocations does NOT panic before initialize_split.
+#[test]
+fn test_get_split_allocations_uninitialized_uses_default() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, RemittanceSplit);
+
+    let total: i128 = 1_000;
+    let allocs = RemittanceSplit::get_split_allocations(&env, total)
+        .expect("uninitialized contract must not return an error for positive amount");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+
+    // Default percentages: 50/30/15/5 → floor values
+    assert_eq!(allocs.get(0).unwrap().amount, 500); // 50% of 1000
+    assert_eq!(allocs.get(1).unwrap().amount, 300); // 30%
+    assert_eq!(allocs.get(2).unwrap().amount, 150); // 15%
+    // Insurance = remainder = 1000 - 500 - 300 - 150 = 50 (matches 5%)
+    assert_eq!(allocs.get(3).unwrap().amount, 50);
+}
+
+/// Shape invariant: uninitialized contract, non-round amount.
+/// Remainder must still land in insurance (slot 3) keeping conservation exact.
+#[test]
+fn test_get_split_allocations_uninitialized_non_round_amount() {
+    let env = Env::default();
+    env.register_contract(None, RemittanceSplit);
+
+    let total: i128 = 7; // prime; will produce remainders with default split
+    let allocs = RemittanceSplit::get_split_allocations(&env, total)
+        .expect("must succeed on positive amount");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+}
+
+/// Shape invariant: single 100% spending config → 4 allocations, savings/bills/insurance == 0,
+/// spending == total_amount, sum == total_amount.
+#[test]
+fn test_get_split_allocations_single_100_percent_spending() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    let (client, _owner, _token_addr, _) = setup_split(&env, 100, 0, 0, 0);
+    let _ = client; // client used only to initialize; call through impl directly
+
+    let total: i128 = 500;
+    let allocs = RemittanceSplit::get_split_allocations(&env, total)
+        .expect("must succeed");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+
+    assert_eq!(allocs.get(0).unwrap().amount, 500, "spending == total");
+    assert_eq!(allocs.get(1).unwrap().amount, 0, "savings == 0");
+    assert_eq!(allocs.get(2).unwrap().amount, 0, "bills == 0");
+    // insurance = 500 - 500 - 0 - 0 = 0
+    assert_eq!(allocs.get(3).unwrap().amount, 0, "insurance == 0");
+}
+
+/// Shape invariant: single 100% insurance config → spending/savings/bills == 0,
+/// insurance == total_amount (remainder path), sum == total_amount.
+#[test]
+fn test_get_split_allocations_single_100_percent_insurance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    let (client, _owner, _token_addr, _) = setup_split(&env, 0, 0, 0, 100);
+    let _ = client;
+
+    let total: i128 = 333;
+    let allocs = RemittanceSplit::get_split_allocations(&env, total)
+        .expect("must succeed");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+
+    assert_eq!(allocs.get(0).unwrap().amount, 0);
+    assert_eq!(allocs.get(1).unwrap().amount, 0);
+    assert_eq!(allocs.get(2).unwrap().amount, 0);
+    // insurance = remainder = 333 - 0 - 0 - 0 = 333
+    assert_eq!(allocs.get(3).unwrap().amount, 333);
+}
+
+/// Shape invariant: zero amount returns Err(InvalidAmount).
+/// No partial allocation is produced; the error fires before any arithmetic.
+#[test]
+fn test_get_split_allocations_zero_amount_returns_error() {
+    let env = Env::default();
+    env.register_contract(None, RemittanceSplit);
+
+    let result = RemittanceSplit::get_split_allocations(&env, 0);
+    assert_eq!(
+        result,
+        Err(RemittanceSplitError::InvalidAmount),
+        "zero amount must return InvalidAmount"
+    );
+}
+
+/// Shape invariant: negative amount returns Err(InvalidAmount).
+#[test]
+fn test_get_split_allocations_negative_amount_returns_error() {
+    let env = Env::default();
+    env.register_contract(None, RemittanceSplit);
+
+    let result = RemittanceSplit::get_split_allocations(&env, -1);
+    assert_eq!(
+        result,
+        Err(RemittanceSplitError::InvalidAmount),
+        "negative amount must return InvalidAmount"
+    );
+}
+
+/// Amount conservation: amount == 1 with equal split produces correct remainder in insurance.
+#[test]
+fn test_get_split_allocations_amount_one_conservation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    // 25/25/25/25: each floor = floor(1*25/100) = 0; insurance = 1 - 0 - 0 - 0 = 1
+    let (client, _owner, _token_addr, _) = setup_split(&env, 25, 25, 25, 25);
+    let _ = client;
+
+    let allocs = RemittanceSplit::get_split_allocations(&env, 1).expect("must succeed");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, 1);
+    // All floor allocations are 0; entire amount goes to insurance as remainder
+    assert_eq!(allocs.get(3).unwrap().amount, 1);
+}
+
+/// Deterministic ordering: calling get_split_allocations twice with the same
+/// state produces identical results in the same category order.
+#[test]
+fn test_get_split_allocations_ordering_is_deterministic() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    let (client, _owner, _token_addr, _) = setup_split(&env, 40, 30, 20, 10);
+    let _ = client;
+
+    let total: i128 = 1_000;
+    let allocs1 = RemittanceSplit::get_split_allocations(&env, total).expect("first call");
+    let allocs2 = RemittanceSplit::get_split_allocations(&env, total).expect("second call");
+
+    assert_eq!(allocs1.len(), allocs2.len());
+    for i in 0..allocs1.len() {
+        let a1 = allocs1.get(i).unwrap();
+        let a2 = allocs2.get(i).unwrap();
+        assert_eq!(a1.category, a2.category, "category at index {i} must match");
+        assert_eq!(a1.amount, a2.amount, "amount at index {i} must match");
+    }
+}
+
+/// Ordering matches get_split / get_config field order: the i-th allocation
+/// amount equals floor(total * split[i] / 100), except insurance which is remainder.
+#[test]
+fn test_get_split_allocations_order_matches_get_split() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    let (client, _owner, _token_addr, _) = setup_split(&env, 40, 30, 20, 10);
+
+    let total: i128 = 1_000;
+    let split = RemittanceSplit::get_split(&env); // [40, 30, 20, 10]
+    let allocs = RemittanceSplit::get_split_allocations(&env, total).expect("must succeed");
+
+    // Verify floor values for the first three categories
+    for i in 0..3u32 {
+        let pct = split.get(i).unwrap() as i128;
+        let expected = total * pct / 100;
+        assert_eq!(
+            allocs.get(i).unwrap().amount,
+            expected,
+            "allocation[{i}] must be floor(total * pct / 100)"
+        );
+    }
+    // Insurance is remainder
+    assert_conservation(&allocs, total);
+}
+
+/// Large amount: i128::MAX / 2 with default config must not overflow and must
+/// satisfy the conservation invariant.
+#[test]
+fn test_get_split_allocations_large_amount_default_config() {
+    let env = Env::default();
+    env.register_contract(None, RemittanceSplit); // uninitialized → default [50,30,15,5]
+
+    let total: i128 = i128::MAX / 2;
+    let allocs = RemittanceSplit::get_split_allocations(&env, total)
+        .expect("i128::MAX/2 must not overflow with default split");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+}
+
+/// Large amount: i128::MAX / 2 with a single 100% spending slot — exercises the
+/// remainder path with a large value.
+#[test]
+fn test_get_split_allocations_large_amount_single_slot() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    let (client, _owner, _token_addr, _) = setup_split(&env, 100, 0, 0, 0);
+    let _ = client;
+
+    let total: i128 = i128::MAX / 2;
+    let allocs = RemittanceSplit::get_split_allocations(&env, total)
+        .expect("i128::MAX/2 with 100/0/0/0 must not overflow");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+    assert_eq!(allocs.get(0).unwrap().amount, total);
+    assert_eq!(allocs.get(3).unwrap().amount, 0);
+}
+
+/// Max-category coverage: percentages spread across all four slots summing to 100.
+/// Verifies conservation and canonical ordering for a non-trivial split.
+#[test]
+fn test_get_split_allocations_percentages_across_all_categories() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 1_000);
+
+    // 33/33/33/1 — non-round split that produces visible dust
+    let (client, _owner, _token_addr, _) = setup_split(&env, 33, 33, 33, 1);
+    let _ = client;
+
+    let total: i128 = 10;
+    let allocs = RemittanceSplit::get_split_allocations(&env, total).expect("must succeed");
+
+    assert_canonical_order(&env, &allocs);
+    assert_conservation(&allocs, total);
+
+    // floor(10*33/100) = 3 for spending, savings, bills
+    assert_eq!(allocs.get(0).unwrap().amount, 3);
+    assert_eq!(allocs.get(1).unwrap().amount, 3);
+    assert_eq!(allocs.get(2).unwrap().amount, 3);
+    // insurance = 10 - 3 - 3 - 3 = 1  (dust absorbed)
+    assert_eq!(allocs.get(3).unwrap().amount, 1);
+}
