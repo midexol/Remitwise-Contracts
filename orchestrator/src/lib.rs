@@ -140,8 +140,8 @@ impl Orchestrator {
         // Use a scope to ensure the guard is dropped (and lock released)
         // before we audit and return.
         let result = {
-            /// The guard acquires the lock on creation and releases it on drop.
-            /// This ensures the lock is released even if we return early via `?`.
+            // The guard acquires the lock on creation and releases it on drop.
+            // This ensures the lock is released even if we return early via `?`.
             let _guard = Self::acquire_execution_lock(&env)?;
 
             Self::perform_remittance_flow(
@@ -303,10 +303,10 @@ impl Orchestrator {
             .instance()
             .set(&symbol_short!("STATS"), &stats);
 
-        /// Emit orchestrator initialization event
-        /// Topic: ("Remitwise", EventCategory::System, EventPriority::High, "init_ok")
-        /// Payload: (caller: Address)
-        /// Emitted when the orchestrator contract is successfully initialized
+        // Emit orchestrator initialization event.
+        // Topic: ("Remitwise", EventCategory::System, EventPriority::High, "init_ok")
+        // Payload: (caller: Address)
+        // Emitted when the orchestrator contract is successfully initialized.
         RemitwiseEvents::emit(
             &env,
             EventCategory::System,
@@ -386,10 +386,10 @@ impl Orchestrator {
             expected_hash,
         )?;
 
-        /// Emit flow lifecycle event - flow started
-        /// Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow")
-        /// Payload: (executor: Address, amount: i128)
-        /// Emitted when a remittance flow execution begins after passing validation
+        // Emit flow lifecycle event - flow started.
+        // Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow")
+        // Payload: (executor: Address, amount: i128)
+        // Emitted when a remittance flow execution begins after passing validation.
         RemitwiseEvents::emit(
             &env,
             EventCategory::Transaction,
@@ -419,10 +419,10 @@ impl Orchestrator {
                 Self::update_execution_stats(&env, true);
                 Self::append_audit(&env, symbol_short!("flow_exec"), &executor, true);
 
-                /// Emit flow lifecycle event - flow completed successfully
-                /// Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow_ok")
-                /// Payload: (executor: Address, amount: i128)
-                /// Emitted when a remittance flow completes successfully
+                // Emit flow lifecycle event - flow completed successfully.
+                // Topic: ("Remitwise", EventCategory::Transaction, EventPriority::High, "flow_ok")
+                // Payload: (executor: Address, amount: i128)
+                // Emitted when a remittance flow completes successfully.
                 RemitwiseEvents::emit(
                     &env,
                     EventCategory::Transaction,
@@ -532,10 +532,10 @@ impl Orchestrator {
             .instance()
             .set(&symbol_short!("VERSION"), &new_version);
 
-        /// Emit orchestrator upgrade event
-        /// Topic: ("orch", "upgraded")
-        /// Payload: (previous_version: u32, new_version: u32)
-        /// Emitted when the contract version is upgraded by the owner
+        // Emit orchestrator upgrade event.
+        // Topic: ("orch", "upgraded")
+        // Payload: (previous_version: u32, new_version: u32)
+        // Emitted when the contract version is upgraded by the owner.
         env.events().publish(
             (symbol_short!("orch"), symbol_short!("upgraded")),
             (prev, new_version),
@@ -916,9 +916,27 @@ mod tests_nonce_eviction {
         let independent_executor = Address::generate(&harness.env);
         let deadline = valid_deadline();
 
-        for nonce in 0..=u64::from(MAX_USED_NONCES_PER_ADDR) {
+        for nonce in 0..u64::from(MAX_USED_NONCES_PER_ADDR) {
             execute_signed_flow(&client, &executor, FLOW_AMOUNT, nonce, deadline);
         }
+
+        let cap_nonce = u64::from(MAX_USED_NONCES_PER_ADDR);
+        assert_eq!(client.get_nonce(&executor), cap_nonce);
+
+        let oldest_before_eviction_hash = request_hash(&executor, FLOW_AMOUNT, 0, deadline);
+        let oldest_before_eviction_replay = client.try_execute_remittance_flow_signed(
+            &executor,
+            &FLOW_AMOUNT,
+            &0,
+            &deadline,
+            &oldest_before_eviction_hash,
+        );
+        assert_eq!(
+            oldest_before_eviction_replay,
+            Err(Ok(OrchestratorError::InvalidNonce))
+        );
+
+        execute_signed_flow(&client, &executor, FLOW_AMOUNT, cap_nonce, deadline);
 
         let next_nonce = u64::from(MAX_USED_NONCES_PER_ADDR) + 1;
         assert_eq!(client.get_nonce(&executor), next_nonce);
