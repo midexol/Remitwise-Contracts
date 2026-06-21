@@ -136,6 +136,7 @@ fn signer_rotation_new_signer_can_sign_and_reach_quorum() {
 // contract error code rather than the human-readable name.
 #[should_panic(expected = "Error(Contract, #2)")]
 fn signer_rotation_rejects_threshold_above_signer_count() {
+
     let env = Env::default();
     env.mock_all_auths();
 
@@ -149,14 +150,17 @@ fn signer_rotation_rejects_threshold_above_signer_count() {
     client.init(&owner, &initial_members);
 
     let impossible_signers = vec![&env, owner.clone(), signer_a.clone()];
-    client.configure_multisig(
+    let result = client.try_configure_multisig(
         &owner,
         &TransactionType::LargeWithdrawal,
         &3,
         &impossible_signers,
         &1_000_0000000,
     );
+
+    assert_eq!(result, Err(Ok(family_wallet::Error::InvalidThreshold)));
 }
+
 
 /// Safety property: removing the proposer from the signer set should invalidate
 /// the old auto-signature or prevent it from contributing to quorum.

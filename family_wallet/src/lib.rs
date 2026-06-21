@@ -655,8 +655,13 @@ impl FamilyWallet {
         }
 
         if threshold > signer_count {
+            // Must return a typed error for `configure_multisig`'s `Result` API.
             return Err(Error::InvalidThreshold);
         }
+
+
+
+
 
         // Check signer membership and uniqueness in a single pass
         let mut checked: Map<Address, bool> = Map::new(&env);
