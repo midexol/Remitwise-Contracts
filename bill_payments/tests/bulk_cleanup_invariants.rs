@@ -290,15 +290,15 @@ fn test_cleanup_mixed_paid_unpaid_archived_state() {
     // 3 unpaid active bills (amount = 100 each)
     let unpaid_ids = create_unpaid_bills(&env, &client, &owner, 3, 100);
 
+    // 3 paid and archived bills (archive before other paid-active bills exist)
+    let archived_ids = create_unpaid_bills(&env, &client, &owner, 3, 300);
+    pay_and_archive(&client, &owner, &archived_ids);
+
     // 2 paid but NOT yet archived active bills
     let paid_not_archived = create_unpaid_bills(&env, &client, &owner, 2, 200);
     for id in &paid_not_archived {
         client.pay_bill(&owner, id);
     }
-
-    // 3 paid and archived bills
-    let archived_ids = create_unpaid_bills(&env, &client, &owner, 3, 300);
-    pay_and_archive(&client, &owner, &archived_ids);
 
     let unpaid_before = client.get_total_unpaid(&owner);
     let active_count_before = client.get_owner_bill_count(&owner);

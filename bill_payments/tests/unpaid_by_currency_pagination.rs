@@ -31,7 +31,7 @@
 //! | `archived_gaps`           | Archived (removed) IDs are skipped cleanly |
 
 use bill_payments::{BillPayments, BillPaymentsClient};
-use soroban_sdk::testutils::{Address as AddressTrait, EnvTestConfig, LedgerInfo};
+use soroban_sdk::testutils::{Address as AddressTrait, EnvTestConfig, Ledger, LedgerInfo};
 use soroban_sdk::{Address, Env, String};
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ fn collect_unpaid_by_currency(
     currency: &str,
     page_size: u32,
 ) -> (std::vec::Vec<u32>, u32) {
-    let env = client.env();
+    let env = &client.env;
     let currency_str = String::from_str(env, currency);
     let mut ids: std::vec::Vec<u32> = std::vec::Vec::new();
     let mut cursor = 0u32;
@@ -450,7 +450,10 @@ fn zero_unpaid_in_currency() {
     let currency = String::from_str(&env, "USDC");
     let page = client.get_unpaid_bills_by_currency(&owner, &currency, &0u32, &50u32);
 
-    assert_eq!(page.count, 0, "expected zero results when all USDC bills are paid");
+    assert_eq!(
+        page.count, 0,
+        "expected zero results when all USDC bills are paid"
+    );
     assert_eq!(page.next_cursor, 0, "next_cursor must be 0 when no results");
     assert_eq!(page.items.len(), 0, "items must be empty");
 }
@@ -588,7 +591,10 @@ fn multi_currency_no_bleed() {
 
     // No bleed between currencies
     for &id in &got_usdc {
-        assert!(!got_xlm.contains(&id), "ID {id} bled from USDC into XLM results");
+        assert!(
+            !got_xlm.contains(&id),
+            "ID {id} bled from USDC into XLM results"
+        );
     }
 }
 
@@ -615,13 +621,19 @@ fn currency_query_case_insensitive() {
     let (lower_ids, _) = collect_unpaid_by_currency(&client, &owner, "usdc", 50);
     let mut ls = lower_ids.clone();
     ls.sort_unstable();
-    assert_eq!(ls, expected, "lowercase currency query returned wrong results");
+    assert_eq!(
+        ls, expected,
+        "lowercase currency query returned wrong results"
+    );
 
     // Query with mixed case
     let (mixed_ids, _) = collect_unpaid_by_currency(&client, &owner, "Usdc", 50);
     let mut ms = mixed_ids.clone();
     ms.sort_unstable();
-    assert_eq!(ms, expected, "mixed-case currency query returned wrong results");
+    assert_eq!(
+        ms, expected,
+        "mixed-case currency query returned wrong results"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -60,8 +60,7 @@ fn sample_accounts(env: &Env) -> AccountGroup {
 fn split_expected(_env: &Env, client: &RemittanceSplitClient<'_>, total_amount: i128) -> [i128; 4] {
     // RemittanceSplitClient's generated binding for `calculate_split` returns a
     // `soroban_sdk::Vec<i128>` directly in this test harness.
-    let alloc = client
-        .calculate_split(&total_amount);
+    let alloc = client.calculate_split(&total_amount);
 
     [
         alloc.get(0).unwrap(),
@@ -73,7 +72,6 @@ fn split_expected(_env: &Env, client: &RemittanceSplitClient<'_>, total_amount: 
 
 #[test]
 fn test_distribution_completed_event() {
-
     let env = Env::default();
     env.mock_all_auths();
 
@@ -140,10 +138,7 @@ fn test_distribution_completed_event() {
     assert_eq!(topics.len(), 4, "Expected 4 topics in event");
 
     // The 4th topic is the action symbol; it must be `dist_ok`.
-    let action: Symbol = topics
-        .get(3)
-        .expect("missing action topic")
-        .into_val(&env);
+    let action: Symbol = topics.get(3).expect("missing action topic").into_val(&env);
     assert_eq!(action, symbol_short!("dist_ok"));
 
     // Verify the structured payload: (from, total_amount).
@@ -1405,50 +1400,37 @@ fn test_execute_due_remittance_schedules_fanout_dust_conservation() {
     let recurring_due_at = now; // exactly due (first interval)
 
     let amounts: [i128; 6] = [
-        101,  // dust-heavy
-        250,  // dust-heavy
-        999,  // near-1000
-        1_003, // different remainder profile
+        101,    // dust-heavy
+        250,    // dust-heavy
+        999,    // near-1000
+        1_003,  // different remainder profile
         10_007, // larger dust surface
-        77,   // small dust
+        77,     // small dust
     ];
 
     // Create 6 schedules, all with next_due <= now, so they are due in this sweep.
     // IDs are monotonic starting at 1 in this test env.
     let mut ids = Vec::new(&env);
 
-
     // One-off schedules (interval 0): will deactivate after execution.
-let id1 = client
-        .create_remittance_schedule(&owner, &amounts[0], &one_off_due_at, &0)
-        ;
+    let id1 = client.create_remittance_schedule(&owner, &amounts[0], &one_off_due_at, &0);
     ids.push_back(id1);
-    let id2 = client
-        .create_remittance_schedule(&owner, &amounts[1], &one_off_due_at, &0);
+    let id2 = client.create_remittance_schedule(&owner, &amounts[1], &one_off_due_at, &0);
 
     ids.push_back(id2);
-
 
     // Recurring schedules: will advance next_due and keep active.
     // Use MIN_SCHEDULE_INTERVAL to respect constraints.
     let interval = MIN_SCHEDULE_INTERVAL;
-let id3 = client
-        .create_remittance_schedule(&owner, &amounts[2], &recurring_due_at, &interval)
-        ;
+    let id3 = client.create_remittance_schedule(&owner, &amounts[2], &recurring_due_at, &interval);
     ids.push_back(id3);
-let id4 = client
-        .create_remittance_schedule(&owner, &amounts[3], &recurring_due_at, &interval)
-        ;
+    let id4 = client.create_remittance_schedule(&owner, &amounts[3], &recurring_due_at, &interval);
     ids.push_back(id4);
-let id5 = client
-        .create_remittance_schedule(&owner, &amounts[4], &recurring_due_at, &interval)
-        ;
+    let id5 = client.create_remittance_schedule(&owner, &amounts[4], &recurring_due_at, &interval);
     ids.push_back(id5);
 
     // Another one-off for balance.
-let id6 = client
-        .create_remittance_schedule(&owner, &amounts[5], &one_off_due_at, &0)
-        ;
+    let id6 = client.create_remittance_schedule(&owner, &amounts[5], &one_off_due_at, &0);
     ids.push_back(id6);
 
     // Execute due schedules at `now`.
@@ -1473,7 +1455,11 @@ let id6 = client
         seen[id as usize] = true;
     }
     for expected in 1..=6u32 {
-        assert!(seen[expected as usize], "missing executed schedule id {}", expected);
+        assert!(
+            seen[expected as usize],
+            "missing executed schedule id {}",
+            expected
+        );
     }
 
     // Per-schedule dust policy pin + aggregate conservation pin.
@@ -1500,7 +1486,9 @@ let id6 = client
         // Reconcile category amounts by calling calculate_split directly and comparing.
         // (The executor stores only next_due/last_executed, so the only authoritative
         // dust policy source is calculate_split.)
-        total_in = total_in.checked_add(sched.amount).expect("aggregate must not overflow");
+        total_in = total_in
+            .checked_add(sched.amount)
+            .expect("aggregate must not overflow");
         for k in 0..4 {
             total_out[k] = total_out[k]
                 .checked_add(expected_allocs[k])
@@ -1535,7 +1523,9 @@ let id6 = client
 
     // And next_due/last_executed should remain unchanged.
     for i in 1..=6u32 {
-        let sched2 = client.get_remittance_schedule(&i).expect("schedule must exist");
+        let sched2 = client
+            .get_remittance_schedule(&i)
+            .expect("schedule must exist");
         assert_eq!(sched2.last_executed, Some(now));
         if sched2.interval == 0 {
             assert!(!sched2.active);
@@ -1549,8 +1539,6 @@ let id6 = client
 
 #[test]
 fn test_execute_mixed_due_not_due() {
-
-
     let env = Env::default();
     let (client, owner, _token_addr, _) = setup_split(&env, 50, 30, 15, 5);
 
@@ -1868,7 +1856,11 @@ fn test_get_schedules_paginated_full_scale_cursor_monotonicity() {
             let schedule = page.items.get(i).unwrap();
             assert!(schedule.id > previous_id, "page IDs must be ascending");
             let seen_index = schedule.id as usize;
-            assert!(!seen[seen_index], "schedule {} appeared on multiple pages", schedule.id);
+            assert!(
+                !seen[seen_index],
+                "schedule {} appeared on multiple pages",
+                schedule.id
+            );
             seen[seen_index] = true;
             seen_count += 1;
             previous_id = schedule.id;
@@ -1941,9 +1933,10 @@ fn test_get_split_allocations_uninitialized_uses_default() {
     let contract_id = env.register_contract(None, RemittanceSplit);
 
     let total: i128 = 1_000;
-    let allocs = RemittanceSplit::get_split_allocations(&env, total)
     let allocs = env
-        .as_contract(&contract_id, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&contract_id, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("uninitialized contract must not return an error for positive amount");
 
     assert_canonical_order(&env, &allocs);
@@ -1953,7 +1946,7 @@ fn test_get_split_allocations_uninitialized_uses_default() {
     assert_eq!(allocs.get(0).unwrap().amount, 500); // 50% of 1000
     assert_eq!(allocs.get(1).unwrap().amount, 300); // 30%
     assert_eq!(allocs.get(2).unwrap().amount, 150); // 15%
-    // Insurance = remainder = 1000 - 500 - 300 - 150 = 50 (matches 5%)
+                                                    // Insurance = remainder = 1000 - 500 - 300 - 150 = 50 (matches 5%)
     assert_eq!(allocs.get(3).unwrap().amount, 50);
 }
 
@@ -1962,15 +1955,13 @@ fn test_get_split_allocations_uninitialized_uses_default() {
 #[test]
 fn test_get_split_allocations_uninitialized_non_round_amount() {
     let env = Env::default();
-    env.register_contract(None, RemittanceSplit);
-
-    let total: i128 = 7; // prime; will produce remainders with default split
-    let allocs = RemittanceSplit::get_split_allocations(&env, total)
     let contract_id = env.register_contract(None, RemittanceSplit);
 
     let total: i128 = 7; // prime; will produce remainders with default split
     let allocs = env
-        .as_contract(&contract_id, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&contract_id, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("must succeed on positive amount");
 
     assert_canonical_order(&env, &allocs);
@@ -1989,11 +1980,10 @@ fn test_get_split_allocations_single_100_percent_spending() {
     let _ = client; // client used only to initialize; call through impl directly
 
     let total: i128 = 500;
-    let allocs = RemittanceSplit::get_split_allocations(&env, total)
-
-    let total: i128 = 500;
     let allocs = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("must succeed");
 
     assert_canonical_order(&env, &allocs);
@@ -2018,11 +2008,10 @@ fn test_get_split_allocations_single_100_percent_insurance() {
     let _ = client;
 
     let total: i128 = 333;
-    let allocs = RemittanceSplit::get_split_allocations(&env, total)
-
-    let total: i128 = 333;
     let allocs = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("must succeed");
 
     assert_canonical_order(&env, &allocs);
@@ -2075,10 +2064,10 @@ fn test_get_split_allocations_amount_one_conservation() {
     let (client, _owner, _token_addr, _) = setup_split(&env, 25, 25, 25, 25);
     let _ = client;
 
-    let allocs = RemittanceSplit::get_split_allocations(&env, 1).expect("must succeed");
-
     let allocs = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, 1))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, 1)
+        })
         .expect("must succeed");
 
     assert_canonical_order(&env, &allocs);
@@ -2099,15 +2088,15 @@ fn test_get_split_allocations_ordering_is_deterministic() {
     let _ = client;
 
     let total: i128 = 1_000;
-    let allocs1 = RemittanceSplit::get_split_allocations(&env, total).expect("first call");
-    let allocs2 = RemittanceSplit::get_split_allocations(&env, total).expect("second call");
-
-    let total: i128 = 1_000;
     let allocs1 = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("first call");
     let allocs2 = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("second call");
 
     assert_eq!(allocs1.len(), allocs2.len());
@@ -2130,11 +2119,11 @@ fn test_get_split_allocations_order_matches_get_split() {
     let (client, _owner, _token_addr, _) = setup_split(&env, 40, 30, 20, 10);
 
     let total: i128 = 1_000;
-    let split = RemittanceSplit::get_split(&env); // [40, 30, 20, 10]
-    let allocs = RemittanceSplit::get_split_allocations(&env, total).expect("must succeed");
     let split = env.as_contract(&client.address, || RemittanceSplit::get_split(&env)); // [40, 30, 20, 10]
     let allocs = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("must succeed");
 
     // Verify floor values for the first three categories
@@ -2151,16 +2140,6 @@ fn test_get_split_allocations_order_matches_get_split() {
     assert_conservation(&allocs, total);
 }
 
-/// Large amount: i128::MAX / 2 with default config must not overflow and must
-/// satisfy the conservation invariant.
-#[test]
-fn test_get_split_allocations_large_amount_default_config() {
-    let env = Env::default();
-    env.register_contract(None, RemittanceSplit); // uninitialized → default [50,30,15,5]
-
-    let total: i128 = i128::MAX / 2;
-    let allocs = RemittanceSplit::get_split_allocations(&env, total)
-        .expect("i128::MAX/2 must not overflow with default split");
 /// Large amount with default config must not overflow and must satisfy the
 /// conservation invariant. `calculate_split` multiplies `total * percent`
 /// before dividing by 100 (with checked arithmetic), so the largest safe input
@@ -2174,15 +2153,15 @@ fn test_get_split_allocations_large_amount_default_config() {
 
     let total: i128 = i128::MAX / 100;
     let allocs = env
-        .as_contract(&contract_id, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&contract_id, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("i128::MAX/100 must not overflow with default split");
 
     assert_canonical_order(&env, &allocs);
     assert_conservation(&allocs, total);
 }
 
-/// Large amount: i128::MAX / 2 with a single 100% spending slot — exercises the
-/// remainder path with a large value.
 /// Large amount with a single 100% spending slot — exercises the remainder path
 /// with a large value. The 100% slot makes 100 the binding multiplier in
 /// `checked_mul(total, 100)`, so `i128::MAX / 100` is the largest input that
@@ -2196,13 +2175,11 @@ fn test_get_split_allocations_large_amount_single_slot() {
     let (client, _owner, _token_addr, _) = setup_split(&env, 100, 0, 0, 0);
     let _ = client;
 
-    let total: i128 = i128::MAX / 2;
-    let allocs = RemittanceSplit::get_split_allocations(&env, total)
-        .expect("i128::MAX/2 with 100/0/0/0 must not overflow");
-
     let total: i128 = i128::MAX / 100;
     let allocs = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("i128::MAX/100 with 100/0/0/0 must not overflow");
 
     assert_canonical_order(&env, &allocs);
@@ -2224,11 +2201,10 @@ fn test_get_split_allocations_percentages_across_all_categories() {
     let _ = client;
 
     let total: i128 = 10;
-    let allocs = RemittanceSplit::get_split_allocations(&env, total).expect("must succeed");
-
-    let total: i128 = 10;
     let allocs = env
-        .as_contract(&client.address, || RemittanceSplit::get_split_allocations(&env, total))
+        .as_contract(&client.address, || {
+            RemittanceSplit::get_split_allocations(&env, total)
+        })
         .expect("must succeed");
 
     assert_canonical_order(&env, &allocs);
